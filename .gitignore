@@ -8,6 +8,7 @@
 *.log
 /tmp/
 test_output.txt
+test.vbs
 
 # 编辑器/IDE
 .vscode/
