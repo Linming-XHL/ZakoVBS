@@ -423,6 +423,28 @@ void lexer_skip_newlines(Lexer *lx) {
     }
 }
 
+LexerSnapshot lexer_save(Lexer *lx) {
+    LexerSnapshot s;
+    s.pos = lx->pos;
+    s.len = lx->len;
+    s.line = lx->line;
+    s.col = lx->col;
+    s.has_peek = lx->has_peek;
+    s.peek = lx->peek;
+    s.peek.text = lx->has_peek && lx->peek.text ? strdup(lx->peek.text) : NULL;
+    return s;
+}
+
+void lexer_restore(Lexer *lx, LexerSnapshot s) {
+    if (lx->has_peek && lx->peek.text) free(lx->peek.text);
+    lx->pos = s.pos;
+    lx->len = s.len;
+    lx->line = s.line;
+    lx->col = s.col;
+    lx->has_peek = s.has_peek;
+    lx->peek = s.peek;
+}
+
 const char *token_type_name(TokenType t) {
     switch (t) {
         case TOK_EOF: return "EOF";

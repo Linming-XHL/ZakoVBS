@@ -130,7 +130,7 @@ struct AstNode {
         struct { AstNode **stmts; int count; } block;
         struct { char **names; int count; AstNode *init_expr; } var_decl;
         struct { char **names; int count; AstNode *init_expr; } const_decl;
-        struct { char *name; AstNode *value; } assign;
+        struct { char *name; AstNode *value; AstNode *index; } assign;
         struct { char *name; AstNode *value; } set_assign;
         struct { int op; AstNode *left, *right; } binop;
         struct { int op; AstNode *operand; } unop;
@@ -255,11 +255,22 @@ typedef struct {
     int has_peek;
 } Lexer;
 
+typedef struct {
+    int pos;
+    int len;
+    int line;
+    int col;
+    int has_peek;
+    Token peek;
+} LexerSnapshot;
+
 Lexer *lexer_new(const char *src);
 void lexer_free(Lexer *lx);
 Token lexer_next(Lexer *lx);
 Token lexer_peek(Lexer *lx);
 void lexer_skip_newlines(Lexer *lx);
+LexerSnapshot lexer_save(Lexer *lx);
+void lexer_restore(Lexer *lx, LexerSnapshot s);
 const char *token_type_name(TokenType t);
 
 /* ========== 解析器 ========== */

@@ -274,7 +274,7 @@ static AstNode *parse_compare(Parser *p) {
     AstNode *left = parse_add(p);
     while (1) {
         Token t = lexer_peek(p->lexer);
-        if (t.type == TOK_EQ || t.type == TOK_NEQ || t.type == TOK_LT ||
+        if (t.type == TOK_EQ || t.type == TOK_ASSIGN || t.type == TOK_NEQ || t.type == TOK_LT ||
             t.type == TOK_GT || t.type == TOK_LE || t.type == TOK_GE || t.type == TOK_IS) {
             lexer_next(p->lexer);
             AstNode *n = ast_alloc(AST_BINOP, t.line);
@@ -345,19 +345,115 @@ static int is_stmt_terminator(TokenType t) {
     }
 }
 
+static AstNode *parse_lvalue(Parser *p) {
+    Token t = lexer_peek(p->lexer);
+    if (t.type != TOK_IDENT) return NULL;
+    lexer_next(p->lexer);
+    AstNode *node = ast_alloc(AST_IDENT, t.line);
+    node->as.ident.name = strdup(t.text);
+
+    while (1) {
+        Token n = lexer_peek(p->lexer);
+        if (n.type == TOK_DOT) {
+            lexer_next(p->lexer);
+            Token pn = lexer_next(p->lexer);
+            if (pn.type != TOK_IDENT) {
+                ast_free(node);
+                return NULL;
+            }
+            if (node->type != AST_IDENT) {
+                ast_free(node);
+                return NULL;
+            }
+            AstNode *prop = ast_alloc(AST_PROP_GET, n.line);
+            prop->as.prop_get.name = strdup(node->as.ident.name);
+            prop->as.prop_get.prop = strdup(pn.text);
+            ast_free(node);
+            node = prop;
+        } else if (n.type == TOK_LPAREN || n.type == TOK_LBRACKET) {
+            TokenType close = (n.type == TOK_LPAREN) ? TOK_RPAREN : TOK_RBRACKET;
+            lexer_next(p->lexer);
+            if (node->type != AST_IDENT) {
+                ast_free(node);
+                return NULL;
+            }
+            AstNode *idx = ast_alloc(AST_INDEX_GET, n.line);
+            idx->as.index_get.name = strdup(node->as.ident.name);
+            idx->as.index_get.index = parse_expr(p);
+            if (lexer_peek(p->lexer).type == TOK_COMMA) {
+                ast_free(node);
+                ast_free(idx);
+                return NULL;
+            }
+            if (lexer_peek(p->lexer).type != close) {
+                ast_free(node);
+                ast_free(idx);
+                return NULL;
+            }
+            lexer_next(p->lexer);
+            ast_free(node);
+            node = idx;
+        } else {
+            break;
+        }
+    }
+    return node;
+}
+
 static AstNode *parse_assign_expr(Parser *p) {
-    AstNode *left = parse_expr(p);
+    LexerSnapshot saved = lexer_save(p->lexer);
+    AstNode *left = parse_lvalue(p);
     Token t = lexer_peek(p->lexer);
 
-    if ((left->type == AST_PROP_GET || left->type == AST_IDENT) && !is_stmt_terminator(t.type)) {
-        AstNode *call = ast_alloc(AST_METHOD_CALL, t.line);
-        if (left->type == AST_PROP_GET) {
-            call->as.method_call.obj = left->as.prop_get.name ?
-                strdup(left->as.prop_get.name) : strdup("");
-            call->as.method_call.method = strdup(left->as.prop_get.prop);
+    if (left && t.type == TOK_ASSIGN) {
+        lexer_next(p->lexer);
+        if (left->type == AST_IDENT) {
+            AstNode *n = ast_alloc(AST_ASSIGN, t.line);
+            n->as.assign.name = strdup(left->as.ident.name);
+            n->as.assign.value = parse_expr(p);
+            n->as.assign.index = NULL;
+            ast_free(left);
+            return n;
+        } else if (left->type == AST_INDEX_GET) {
+            AstNode *n = ast_alloc(AST_ASSIGN, t.line);
+            n->as.assign.name = strdup(left->as.index_get.name);
+            n->as.assign.index = left->as.index_get.index;
+            n->as.assign.value = parse_expr(p);
+            left->as.index_get.index = NULL;
+            ast_free(left);
+            return n;
+        } else if (left->type == AST_PROP_GET) {
+            AstNode *n = ast_alloc(AST_ASSIGN, t.line);
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s.%s", left->as.prop_get.name, left->as.prop_get.prop);
+            n->as.assign.name = strdup(buf);
+            n->as.assign.value = parse_expr(p);
+            n->as.assign.index = NULL;
+            ast_free(left);
+            return n;
+        } else {
+            parser_error(p, "第%d行: 无效的赋值目标", t.line);
+            ast_free(left);
+            AstNode *n = ast_alloc(AST_LITERAL, t.line);
+            n->as.literal.value = val_empty();
+            return n;
+        }
+    }
+
+    if (left) ast_free(left);
+    lexer_restore(p->lexer, saved);
+
+    AstNode *e = parse_expr(p);
+    Token t2 = lexer_peek(p->lexer);
+    if ((e->type == AST_PROP_GET || e->type == AST_IDENT) && !is_stmt_terminator(t2.type)) {
+        AstNode *call = ast_alloc(AST_METHOD_CALL, t2.line);
+        if (e->type == AST_PROP_GET) {
+            call->as.method_call.obj = e->as.prop_get.name ?
+                strdup(e->as.prop_get.name) : strdup("");
+            call->as.method_call.method = strdup(e->as.prop_get.prop);
         } else {
             call->as.method_call.obj = strdup("");
-            call->as.method_call.method = strdup(left->as.ident.name);
+            call->as.method_call.method = strdup(e->as.ident.name);
         }
         int cap = 8;
         call->as.method_call.args = malloc(sizeof(AstNode*) * cap);
@@ -371,43 +467,10 @@ static AstNode *parse_assign_expr(Parser *p) {
             }
             call->as.method_call.args[call->as.method_call.argc++] = parse_expr(p);
         }
-        ast_free(left);
+        ast_free(e);
         return call;
     }
-
-    if (t.type == TOK_ASSIGN) {
-        lexer_next(p->lexer);
-        if (left->type == AST_IDENT) {
-            AstNode *n = ast_alloc(AST_ASSIGN, t.line);
-            n->as.assign.name = strdup(left->as.ident.name);
-            n->as.assign.value = parse_assign_expr(p);
-            ast_free(left);
-            return n;
-        } else if (left->type == AST_INDEX_GET) {
-            AstNode *n = ast_alloc(AST_ASSIGN, t.line);
-            char buf[256];
-            snprintf(buf, sizeof(buf), "%s[]", left->as.index_get.name);
-            n->as.assign.name = strdup(buf);
-            n->as.assign.value = parse_assign_expr(p);
-            ast_free(left);
-            return n;
-        } else if (left->type == AST_PROP_GET) {
-            AstNode *n = ast_alloc(AST_ASSIGN, t.line);
-            char buf[256];
-            snprintf(buf, sizeof(buf), "%s.%s", left->as.prop_get.name, left->as.prop_get.prop);
-            n->as.assign.name = strdup(buf);
-            n->as.assign.value = parse_assign_expr(p);
-            ast_free(left);
-            return n;
-        } else {
-            parser_error(p, "第%d行: 无效的赋值目标", t.line);
-            ast_free(left);
-            AstNode *n = ast_alloc(AST_LITERAL, t.line);
-            n->as.literal.value = val_empty();
-            return n;
-        }
-    }
-    return left;
+    return e;
 }
 
 /* ========== 解析语句 ========== */
@@ -830,19 +893,29 @@ static AstNode *parse_stmt(Parser *p) {
         }
         case TOK_KEY_SET: {
             lexer_next(p->lexer);
-            AstNode *expr = parse_expr(p);
+            AstNode *lhs = parse_lvalue(p);
+            if (!lhs) {
+                parser_error(p, "第%d行: Set 需要变量名", t.line);
+                return ast_alloc(AST_LITERAL, t.line);
+            }
             lexer_skip_newlines(p->lexer);
             expect(p, TOK_ASSIGN);
             lexer_skip_newlines(p->lexer);
             AstNode *n = ast_alloc(AST_SET_ASSIGN, t.line);
-            if (expr->type == AST_IDENT) {
-                n->as.set_assign.name = strdup(expr->as.ident.name);
+            if (lhs->type == AST_IDENT) {
+                n->as.set_assign.name = strdup(lhs->as.ident.name);
+            } else if (lhs->type == AST_PROP_GET) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s.%s", lhs->as.prop_get.name, lhs->as.prop_get.prop);
+                n->as.set_assign.name = strdup(buf);
+            } else if (lhs->type == AST_INDEX_GET) {
+                n->as.set_assign.name = strdup(lhs->as.index_get.name);
             } else {
                 n->as.set_assign.name = strdup("");
                 parser_error(p, "第%d行: Set 需要变量名", t.line);
             }
             n->as.set_assign.value = parse_expr(p);
-            ast_free(expr);
+            ast_free(lhs);
             return n;
         }
         case TOK_KEY_ON: {
@@ -1001,6 +1074,7 @@ void ast_free(AstNode *node) {
         case AST_ASSIGN:
             free(node->as.assign.name);
             if (node->as.assign.value) ast_free(node->as.assign.value);
+            if (node->as.assign.index) ast_free(node->as.assign.index);
             break;
         case AST_SET_ASSIGN:
             free(node->as.set_assign.name);

@@ -525,7 +525,8 @@ static Value interp_eval_binop(Interp *interp, int op, Value left, Value right) 
             free(rs);
             break;
         }
-        case TOK_EQ: r = val_bool(val_todouble(left) == val_todouble(right)); break;
+        case TOK_EQ:
+        case TOK_ASSIGN: r = val_bool(val_todouble(left) == val_todouble(right)); break;
         case TOK_NEQ: {
             if (left.type == VALTYPE_STRING || right.type == VALTYPE_STRING) {
                 char *ls = val_tostr(left);
@@ -638,12 +639,10 @@ Value interp_eval(Interp *interp, AstNode *node) {
         case AST_ASSIGN: {
             Value v = interp_eval(interp, node->as.assign.value);
             char *name = node->as.assign.name;
-            char *idx = strstr(name, "[]");
-            if (idx) {
-                *idx = 0;
+            if (node->as.assign.index) {
                 Value av = interp_get_var(interp, name);
                 if (av.type == VALTYPE_ARRAY && av.as.arr) {
-                    Value iv = interp_eval(interp, node->as.assign.value);
+                    Value iv = interp_eval(interp, node->as.assign.index);
                     long long index = val_toint(iv);
                     val_free(&iv);
                     if (index >= 0 && index < av.as.arr->total_size) {
@@ -652,10 +651,14 @@ Value interp_eval(Interp *interp, AstNode *node) {
                     }
                 }
                 val_free(&av);
-                *idx = '[';
-            } else {
-                interp_set_var(interp, name, v, 0);
+                val_free(&v);
+                return val_empty();
             }
+            if (strchr(name, '.')) {
+                val_free(&v);
+                return val_empty();
+            }
+            interp_set_var(interp, name, v, 0);
             return val_empty();
         }
 
