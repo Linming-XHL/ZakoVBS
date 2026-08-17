@@ -24,7 +24,7 @@ static char *read_file(const char *path) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "用法: vbs <文件路径>\n");
+        fprintf(stderr, "用法: vbs <文件路径> [参数...]\n");
         fprintf(stderr, "运行 VBScript 脚本文件\n");
         return 1;
     }
@@ -47,6 +47,10 @@ int main(int argc, char *argv[]) {
     }
 
     Interp *interp = interp_new(parser->program, path);
+
+    for (int i = 2; i < argc; i++) {
+        interp_add_arg(interp, argv[i]);
+    }
 
     int result = interp_run(interp);
 

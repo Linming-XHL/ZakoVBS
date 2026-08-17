@@ -1,6 +1,38 @@
 #define _GNU_SOURCE
 #include "vbs.h"
 #include <gtk/gtk.h>
+#include <regex.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <dirent.h>
+
+static void expand_environment(const char *src, char *dst, int dstsize) {
+    int pos = 0;
+    const char *p = src;
+    while (*p && pos < dstsize - 1) {
+        if (*p == '%') {
+            const char *end = strchr(p + 1, '%');
+            if (end) {
+                char var[256];
+                int len = end - p - 1;
+                if (len > 0 && len < 256) {
+                    strncpy(var, p + 1, len);
+                    var[len] = 0;
+                    const char *val = getenv(var);
+                    if (val) {
+                        strncpy(dst + pos, val, dstsize - pos - 1);
+                        pos += strlen(val);
+                    }
+                    p = end + 1;
+                    continue;
+                }
+            }
+        }
+        dst[pos++] = *p++;
+    }
+    dst[pos] = 0;
+}
 
 /* ========== GTK 对话框辅助函数 ========== */
 static int gtk_initialized = 0;
@@ -652,6 +684,200 @@ static Value fn_timevalue(Interp *interp, int argc, Value *argv) {
     return val_str(val_tostr(argv[0]));
 }
 
+static struct tm parse_datetime(const char *s) {
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    if (!strptime(s, "%Y-%m-%d %H:%M:%S", &tm) &&
+        !strptime(s, "%Y-%m-%d %H:%M", &tm) &&
+        !strptime(s, "%Y-%m-%d", &tm) &&
+        !strptime(s, "%Y/%m/%d %H:%M:%S", &tm) &&
+        !strptime(s, "%Y/%m/%d", &tm)) {
+        strptime(s, "%H:%M:%S", &tm);
+    }
+    return tm;
+}
+
+static void apply_interval(struct tm *tm, const char *iv, long long num) {
+    if (!iv) return;
+    if (strcasecmp(iv, "yyyy") == 0) tm->tm_year += num;
+    else if (strcasecmp(iv, "q") == 0) tm->tm_mon += num * 3;
+    else if (strcasecmp(iv, "m") == 0) tm->tm_mon += num;
+    else if (strcasecmp(iv, "y") == 0 || strcasecmp(iv, "d") == 0 ||
+             strcasecmp(iv, "w") == 0 || strcasecmp(iv, "ww") == 0)
+        tm->tm_mday += num;
+    else if (strcasecmp(iv, "h") == 0) tm->tm_hour += num;
+    else if (strcasecmp(iv, "n") == 0) tm->tm_min += num;
+    else if (strcasecmp(iv, "s") == 0) tm->tm_sec += num;
+}
+
+static Value fn_dateadd(Interp *interp, int argc, Value *argv) {
+    if (argc < 3) return val_str("");
+    char *iv = val_tostr(argv[0]);
+    long long num = val_toint(argv[1]);
+    char *date = val_tostr(argv[2]);
+    struct tm tm = parse_datetime(date);
+    apply_interval(&tm, iv, num);
+    char buf[64];
+    if (strpbrk(date, ":") && !strpbrk(date, "-")) {
+        strftime(buf, sizeof(buf), "%H:%M:%S", &tm);
+    } else {
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    }
+    free(iv);
+    free(date);
+    return val_str(buf);
+}
+
+static long long diff_interval(const struct tm *t1, const struct tm *t2, const char *iv) {
+    if (!iv) return 0;
+    time_t a = mktime((struct tm*)t1);
+    time_t b = mktime((struct tm*)t2);
+    double diff = difftime(b, a);
+    if (strcasecmp(iv, "s") == 0) return (long long)diff;
+    if (strcasecmp(iv, "n") == 0) return (long long)(diff / 60);
+    if (strcasecmp(iv, "h") == 0) return (long long)(diff / 3600);
+    if (strcasecmp(iv, "d") == 0 || strcasecmp(iv, "y") == 0) return (long long)(diff / 86400);
+    if (strcasecmp(iv, "w") == 0 || strcasecmp(iv, "ww") == 0) return (long long)(diff / (86400 * 7));
+    if (strcasecmp(iv, "m") == 0) {
+        long long months = (t2->tm_year - t1->tm_year) * 12 + (t2->tm_mon - t1->tm_mon);
+        return months;
+    }
+    if (strcasecmp(iv, "q") == 0) {
+        long long months = (t2->tm_year - t1->tm_year) * 12 + (t2->tm_mon - t1->tm_mon);
+        return months / 3;
+    }
+    if (strcasecmp(iv, "yyyy") == 0) return t2->tm_year - t1->tm_year;
+    return (long long)diff;
+}
+
+static Value fn_datediff(Interp *interp, int argc, Value *argv) {
+    if (argc < 3) return val_int(0);
+    char *iv = val_tostr(argv[0]);
+    char *d1 = val_tostr(argv[1]);
+    char *d2 = val_tostr(argv[2]);
+    struct tm t1 = parse_datetime(d1);
+    struct tm t2 = parse_datetime(d2);
+    long long r = diff_interval(&t1, &t2, iv);
+    free(iv);
+    free(d1);
+    free(d2);
+    return val_int(r);
+}
+
+static Value fn_datepart(Interp *interp, int argc, Value *argv) {
+    if (argc < 2) return val_int(0);
+    char *iv = val_tostr(argv[0]);
+    char *date = val_tostr(argv[1]);
+    struct tm tm = parse_datetime(date);
+    long long r = 0;
+    if (strcasecmp(iv, "yyyy") == 0) r = tm.tm_year + 1900;
+    else if (strcasecmp(iv, "q") == 0) r = tm.tm_mon / 3 + 1;
+    else if (strcasecmp(iv, "m") == 0) r = tm.tm_mon + 1;
+    else if (strcasecmp(iv, "y") == 0) r = tm.tm_yday + 1;
+    else if (strcasecmp(iv, "d") == 0) r = tm.tm_mday;
+    else if (strcasecmp(iv, "w") == 0) r = tm.tm_wday + 1;
+    else if (strcasecmp(iv, "ww") == 0) r = tm.tm_yday / 7 + 1;
+    else if (strcasecmp(iv, "h") == 0) r = tm.tm_hour;
+    else if (strcasecmp(iv, "n") == 0) r = tm.tm_min;
+    else if (strcasecmp(iv, "s") == 0) r = tm.tm_sec;
+    free(iv);
+    free(date);
+    return val_int(r);
+}
+
+static Value fn_timer(Interp *interp, int argc, Value *argv) {
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    double secs = tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec;
+    return val_double(secs);
+}
+
+static Value fn_isdate(Interp *interp, int argc, Value *argv) {
+    if (argv[0].type != VALTYPE_STRING) return val_bool(0);
+    char *s = val_tostr(argv[0]);
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    int ok = strptime(s, "%Y-%m-%d %H:%M:%S", &tm) ||
+             strptime(s, "%Y-%m-%d", &tm) ||
+             strptime(s, "%Y/%m/%d", &tm) ||
+             strptime(s, "%H:%M:%S", &tm);
+    free(s);
+    return val_bool(ok ? 1 : 0);
+}
+
+static Value fn_formatdatetime(Interp *interp, int argc, Value *argv) {
+    if (argc < 1) return val_str("");
+    char *s = val_tostr(argv[0]);
+    int fmt = (argc >= 2) ? (int)val_toint(argv[1]) : 0;
+    struct tm tm = parse_datetime(s);
+    char buf[128];
+    switch (fmt) {
+        case 1: strftime(buf, sizeof(buf), "yyyy年m月d日", &tm); break;
+        case 2: strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm); break;
+        case 3: strftime(buf, sizeof(buf), "%H:%M", &tm); break;
+        case 4: strftime(buf, sizeof(buf), "%H:%M:%S", &tm); break;
+        default: strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    }
+    free(s);
+    return val_str(buf);
+}
+
+static Value fn_formatnumber(Interp *interp, int argc, Value *argv) {
+    double d = val_todouble(argv[0]);
+    int digits = (argc >= 2) ? (int)val_toint(argv[1]) : -1;
+    char buf[64];
+    if (digits >= 0) {
+        snprintf(buf, sizeof(buf), "%.*f", digits, d);
+    } else {
+        snprintf(buf, sizeof(buf), "%.15g", d);
+    }
+    return val_str(buf);
+}
+
+static Value fn_formatpercent(Interp *interp, int argc, Value *argv) {
+    double d = val_todouble(argv[0]);
+    int digits = (argc >= 2) ? (int)val_toint(argv[1]) : 2;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.*f%%", digits, d * 100);
+    return val_str(buf);
+}
+
+static Value fn_formatcurrency(Interp *interp, int argc, Value *argv) {
+    double d = val_todouble(argv[0]);
+    int digits = (argc >= 2) ? (int)val_toint(argv[1]) : 2;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.*f", digits, d);
+    return val_str(buf);
+}
+
+static Value fn_filter(Interp *interp, int argc, Value *argv) {
+    if (argv[0].type != VALTYPE_ARRAY) return val_empty();
+    VbsArray *src = argv[0].as.arr;
+    char *match = val_tostr(argv[1]);
+    int include = (argc >= 3) ? val_tobool(argv[2]) : 1;
+    int comp = (argc >= 4) ? (int)val_toint(argv[3]) : 0;
+
+    VbsArray *a = arr_new_1d(0);
+    int count = 0;
+    for (int i = 0; i < src->total_size; i++) {
+        char *s = val_tostr(src->data[i]);
+        int found = comp ? (strcasestr(s, match) != NULL) : (strstr(s, match) != NULL);
+        free(s);
+        if (found == include) {
+            if (count >= a->total_size) {
+                a->dims[0] = count + 1;
+                a->data = realloc(a->data, sizeof(Value) * (count + 1));
+                memset(&a->data[count], 0, sizeof(Value));
+                a->total_size = a->dims[0];
+            }
+            a->data[count++] = val_clone(src->data[i]);
+        }
+    }
+    a->dims[0] = count;
+    free(match);
+    return val_arr(a);
+}
+
 /* ========== 杂项函数 ========== */
 static Value fn_isnull(Interp *interp, int argc, Value *argv) {
     return val_bool(argv[0].type == VALTYPE_NULL);
@@ -736,8 +962,18 @@ static Value fn_createobject(Interp *interp, int argc, Value *argv) {
     } else if (strcasecmp(name, "Scripting.Dictionary") == 0 ||
         strcasecmp(name, "Dictionary") == 0) {
         obj = dict_create();
+    } else if (strcasecmp(name, "VBScript.RegExp") == 0 ||
+        strcasecmp(name, "RegExp") == 0) {
+        obj = regexp_create();
+    } else if (strcasecmp(name, "WScript.Shell") == 0 ||
+        strcasecmp(name, "WshShell") == 0 ||
+        strcasecmp(name, "Shell") == 0) {
+        obj = wshshell_create();
+    } else if (strcasecmp(name, "WScript.Network") == 0 ||
+        strcasecmp(name, "WshNetwork") == 0) {
+        obj = obj_new("WshNetwork", NULL, NULL, NULL, NULL);
     } else {
-        interp_error(interp, "CreateObject: 不支持的对象: %s", name);
+        interp_error_num(interp, 429, "CreateObject: 不支持的对象: %s", name);
     }
     free(name);
     return val_obj(obj);
@@ -758,7 +994,12 @@ static Value fn_wscript_echo(Interp *interp, int argc, Value *argv) {
 
 
 /* ========== WScript 对象实现 ========== */
+static void wscript_destroy(Object *obj) {
+    (void)obj;
+}
+
 static Value wscript_get_prop(Object *obj, const char *name) {
+    Interp *interp = (Interp*)obj->data;
     if (strcasecmp(name, "FullName") == 0) {
         return val_str("vbs");
     }
@@ -766,13 +1007,16 @@ static Value wscript_get_prop(Object *obj, const char *name) {
         return val_str(".");
     }
     if (strcasecmp(name, "ScriptFullName") == 0) {
-        return val_str("");
+        return val_str(interp && interp->script_path ? interp->script_path : "");
     }
     if (strcasecmp(name, "ScriptName") == 0) {
-        return val_str("");
+        const char *p = interp && interp->script_path ? interp->script_path : "";
+        const char *slash = strrchr(p, '/');
+        return val_str(slash ? slash + 1 : p);
     }
-    if (strcasecmp(name, "Arguments") == 0) {
-        return val_obj(obj);
+    if (strcasecmp(name, "Arguments") == 0 ||
+        strcasecmp(name, "Arguments.Count") == 0) {
+        return val_int(interp ? interp->script_arg_count : 0);
     }
     return val_empty();
 }
@@ -799,11 +1043,19 @@ static Value wscript_call_method(Object *obj, Interp *interp, const char *name, 
     if (strcasecmp(name, "CreateObject") == 0) {
         return fn_createobject(interp, argc, argv);
     }
+    if (strcasecmp(name, "Arguments") == 0) {
+        int count = interp ? interp->script_arg_count : 0;
+        int idx = (argc >= 1) ? (int)val_toint(argv[0]) : 0;
+        if (idx >= 0 && idx < count) {
+            return val_str(interp->script_args[idx]);
+        }
+        return val_str("");
+    }
     return val_empty();
 }
 
-Object *wscript_create(const char *path) {
-    return obj_new("WScript", NULL, NULL, wscript_get_prop, wscript_call_method);
+Object *wscript_create(Interp *interp) {
+    return obj_new("WScript", interp, wscript_destroy, wscript_get_prop, wscript_call_method);
 }
 
 /* ========== FileSystemObject 实现 ========== */
@@ -912,6 +1164,18 @@ static Value textstream_call_method(Object *obj, Interp *interp, const char *nam
     }
     return val_empty();
 }
+
+typedef struct { char *path; } FolderData;
+static void folder_destroy(Object *obj);
+static Value folder_get_prop(Object *obj, const char *name);
+static Value folder_call_method(Object *obj, Interp *interp, const char *name, int argc, Value *argv);
+typedef struct { char *path; } FileData;
+static void file_destroy(Object *obj);
+static Value file_get_prop(Object *obj, const char *name);
+static Value file_call_method(Object *obj, Interp *interp, const char *name, int argc, Value *argv);
+typedef struct { char *letter; } DriveData;
+static void drive_destroy(Object *obj);
+static Value drive_get_prop(Object *obj, const char *name);
 
 static Value fso_call_method(Object *obj, Interp *interp, const char *name, int argc, Value *argv) {
     if (strcasecmp(name, "CreateTextFile") == 0) {
@@ -1059,6 +1323,289 @@ static Value fso_call_method(Object *obj, Interp *interp, const char *name, int 
         free(p2);
         return r;
     }
+    if (strcasecmp(name, "CopyFile") == 0) {
+        if (argc < 2) return val_empty();
+        char *src = val_tostr(argv[0]);
+        char *dest = val_tostr(argv[1]);
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd), "cp \"%s\" \"%s\"", src, dest);
+        if (system(cmd) == -1) {}
+        free(src);
+        free(dest);
+        return val_empty();
+    }
+    if (strcasecmp(name, "MoveFile") == 0) {
+        if (argc < 2) return val_empty();
+        char *src = val_tostr(argv[0]);
+        char *dest = val_tostr(argv[1]);
+        rename(src, dest);
+        free(src);
+        free(dest);
+        return val_empty();
+    }
+    if (strcasecmp(name, "CreateFolder") == 0) {
+        if (argc < 1) return val_empty();
+        char *p = val_tostr(argv[0]);
+        mkdir(p, 0777);
+        free(p);
+        return val_empty();
+    }
+    if (strcasecmp(name, "DeleteFolder") == 0) {
+        if (argc < 1) return val_empty();
+        char *p = val_tostr(argv[0]);
+        rmdir(p);
+        free(p);
+        return val_empty();
+    }
+    if (strcasecmp(name, "FolderExists") == 0) {
+        if (argc < 1) return val_bool(0);
+        char *p = val_tostr(argv[0]);
+        struct stat st;
+        int r = (stat(p, &st) == 0 && S_ISDIR(st.st_mode));
+        free(p);
+        return val_bool(r);
+    }
+    if (strcasecmp(name, "GetFolder") == 0) {
+        if (argc < 1) return val_empty();
+        FolderData *fd = calloc(1, sizeof(FolderData));
+        fd->path = val_tostr(argv[0]);
+        return val_obj(obj_new("Folder", fd, folder_destroy, folder_get_prop, folder_call_method));
+    }
+    if (strcasecmp(name, "GetFile") == 0) {
+        if (argc < 1) return val_empty();
+        FileData *fd = calloc(1, sizeof(FileData));
+        fd->path = val_tostr(argv[0]);
+        return val_obj(obj_new("File", fd, file_destroy, file_get_prop, file_call_method));
+    }
+    if (strcasecmp(name, "GetDrive") == 0) {
+        if (argc < 1) return val_empty();
+        DriveData *dd = calloc(1, sizeof(DriveData));
+        dd->letter = val_tostr(argv[0]);
+        return val_obj(obj_new("Drive", dd, drive_destroy, drive_get_prop, NULL));
+    }
+    if (strcasecmp(name, "GetSpecialFolder") == 0) {
+        if (argc < 1) return val_empty();
+        int which = (int)val_toint(argv[0]);
+        const char *path = ".";
+        if (which == 0) path = getenv("WINDIR") ? getenv("WINDIR") : "/tmp";
+        else if (which == 1) path = getenv("SYSTEMROOT") ? getenv("SYSTEMROOT") : "/usr";
+        else if (which == 2) path = getenv("TEMP") ? getenv("TEMP") : "/tmp";
+        FolderData *fd = calloc(1, sizeof(FolderData));
+        fd->path = strdup(path);
+        return val_obj(obj_new("Folder", fd, folder_destroy, folder_get_prop, folder_call_method));
+    }
+    return val_empty();
+}
+
+/* ========== Folder / File / Drive 对象 ========== */
+static void folder_destroy(Object *obj) {
+    FolderData *d = (FolderData*)obj->data;
+    if (d) { free(d->path); free(d); }
+}
+
+static char *path_basename(const char *path) {
+    const char *p = strrchr(path, '/');
+    if (!p) p = strrchr(path, '\\');
+    return strdup(p ? p + 1 : path);
+}
+
+static char *time_str(const struct stat *st) {
+    struct tm tm;
+    localtime_r(&st->st_mtime, &tm);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    return strdup(buf);
+}
+
+static Value folder_get_prop(Object *obj, const char *name) {
+    FolderData *d = (FolderData*)obj->data;
+    if (!d) return val_empty();
+    if (strcasecmp(name, "Path") == 0) return val_str(d->path);
+    if (strcasecmp(name, "Name") == 0) {
+        char *b = path_basename(d->path);
+        Value r = val_str(b);
+        free(b);
+        return r;
+    }
+    if (strcasecmp(name, "ParentFolder") == 0) {
+        char *copy = strdup(d->path);
+        char *slash = strrchr(copy, '/');
+        if (!slash) slash = strrchr(copy, '\\');
+        if (slash) *slash = 0;
+        Value r = val_str(copy);
+        free(copy);
+        return r;
+    }
+    if (strcasecmp(name, "Size") == 0) {
+        struct stat st;
+        if (stat(d->path, &st) == 0) return val_int(st.st_size);
+        return val_int(0);
+    }
+    if (strcasecmp(name, "DateCreated") == 0 ||
+        strcasecmp(name, "DateLastModified") == 0) {
+        struct stat st;
+        if (stat(d->path, &st) == 0) {
+            char *s = time_str(&st);
+            Value r = val_str(s);
+            free(s);
+            return r;
+        }
+        return val_str("");
+    }
+    return val_empty();
+}
+
+static Value folder_files_array(const char *path, int want_files) {
+    DIR *dir = opendir(path);
+    VbsArray *a = arr_new_1d(0);
+    int count = 0;
+    if (dir) {
+        struct dirent *e;
+        while ((e = readdir(dir)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            char full[4096];
+            snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+            struct stat st;
+            if (stat(full, &st) != 0) continue;
+            int is_dir = S_ISDIR(st.st_mode);
+            if (want_files && is_dir) continue;
+            if (!want_files && !is_dir) continue;
+            if (count >= a->total_size) {
+                a->dims[0] = count + 1;
+                a->data = realloc(a->data, sizeof(Value) * (count + 1));
+                memset(&a->data[count], 0, sizeof(Value));
+                a->total_size = a->dims[0];
+            }
+            a->data[count++] = val_str(e->d_name);
+        }
+        closedir(dir);
+    }
+    a->dims[0] = count;
+    return val_arr(a);
+}
+
+static Value folder_call_method(Object *obj, Interp *interp, const char *name, int argc, Value *argv) {
+    FolderData *d = (FolderData*)obj->data;
+    if (strcasecmp(name, "Files") == 0) {
+        return folder_files_array(d->path, 1);
+    }
+    if (strcasecmp(name, "SubFolders") == 0) {
+        return folder_files_array(d->path, 0);
+    }
+    if (strcasecmp(name, "Delete") == 0) {
+        rmdir(d->path);
+        return val_empty();
+    }
+    if (strcasecmp(name, "Move") == 0 || strcasecmp(name, "Copy") == 0) {
+        if (argc < 1) return val_empty();
+        char *dest = val_tostr(argv[0]);
+        if (strcasecmp(name, "Move") == 0) {
+            rename(d->path, dest);
+        } else {
+            char cmd[4096];
+            snprintf(cmd, sizeof(cmd), "cp -r \"%s\" \"%s\"", d->path, dest);
+            if (system(cmd) == -1) {}
+        }
+        free(dest);
+        return val_empty();
+    }
+    return val_empty();
+}
+
+static void file_destroy(Object *obj) {
+    FileData *d = (FileData*)obj->data;
+    if (d) { free(d->path); free(d); }
+}
+
+static Value file_get_prop(Object *obj, const char *name) {
+    FileData *d = (FileData*)obj->data;
+    if (!d) return val_empty();
+    if (strcasecmp(name, "Path") == 0) return val_str(d->path);
+    if (strcasecmp(name, "Name") == 0) {
+        char *b = path_basename(d->path);
+        Value r = val_str(b);
+        free(b);
+        return r;
+    }
+    struct stat st;
+    if (stat(d->path, &st) == 0) {
+        if (strcasecmp(name, "Size") == 0) return val_int(st.st_size);
+        if (strcasecmp(name, "DateCreated") == 0 ||
+            strcasecmp(name, "DateLastModified") == 0) {
+            char *s = time_str(&st);
+            Value r = val_str(s);
+            free(s);
+            return r;
+        }
+    }
+    return val_empty();
+}
+
+static Value file_call_method(Object *obj, Interp *interp, const char *name, int argc, Value *argv) {
+    FileData *d = (FileData*)obj->data;
+    if (strcasecmp(name, "Delete") == 0) {
+        remove(d->path);
+        return val_empty();
+    }
+    if (strcasecmp(name, "Move") == 0) {
+        if (argc < 1) return val_empty();
+        char *dest = val_tostr(argv[0]);
+        rename(d->path, dest);
+        free(dest);
+        return val_empty();
+    }
+    if (strcasecmp(name, "Copy") == 0) {
+        if (argc < 1) return val_empty();
+        char *dest = val_tostr(argv[0]);
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd), "cp \"%s\" \"%s\"", d->path, dest);
+        if (system(cmd) == -1) {}
+        free(dest);
+        return val_empty();
+    }
+    if (strcasecmp(name, "OpenAsTextStream") == 0) {
+        int iomode = (argc >= 1) ? (int)val_toint(argv[0]) : 1;
+        FILE *fp = NULL;
+        switch (iomode) {
+            case 1: fp = fopen(d->path, "r"); break;
+            case 2: fp = fopen(d->path, "w"); break;
+            case 8: fp = fopen(d->path, "a"); break;
+            default: fp = fopen(d->path, "r");
+        }
+        if (!fp) {
+            interp_error(interp, "无法打开文件: %s", d->path);
+            return val_empty();
+        }
+        FSOData *fd = calloc(1, sizeof(FSOData));
+        fd->fp = fp;
+        fd->open = 1;
+        fd->for_reading = (iomode == 1);
+        return val_obj(obj_new("TextStream", fd, fso_destroy, textstream_get_prop, textstream_call_method));
+    }
+    return val_empty();
+}
+
+static void drive_destroy(Object *obj) {
+    DriveData *d = (DriveData*)obj->data;
+    if (d) { free(d->letter); free(d); }
+}
+
+static Value drive_get_prop(Object *obj, const char *name) {
+    DriveData *d = (DriveData*)obj->data;
+    if (!d) return val_empty();
+    if (strcasecmp(name, "DriveLetter") == 0) return val_str(d->letter);
+    if (strcasecmp(name, "Path") == 0) return val_str(d->letter);
+    struct statvfs vfs;
+    char mount[64];
+    snprintf(mount, sizeof(mount), "/");
+    if (statvfs(mount, &vfs) == 0) {
+        if (strcasecmp(name, "FreeSpace") == 0)
+            return val_int((long long)vfs.f_bavail * vfs.f_frsize);
+        if (strcasecmp(name, "TotalSize") == 0)
+            return val_int((long long)vfs.f_blocks * vfs.f_frsize);
+        if (strcasecmp(name, "AvailableSpace") == 0)
+            return val_int((long long)vfs.f_bavail * vfs.f_frsize);
+    }
     return val_empty();
 }
 
@@ -1190,6 +1737,305 @@ Object *dict_create(void) {
     return obj_new("Dictionary", d, dict_destroy, dict_get_prop, dict_call_method);
 }
 
+/* ========== Err 对象 ========== */
+static void err_destroy(Object *obj) {
+    ErrData *d = (ErrData*)obj->data;
+    if (d) {
+        if (d->description) free(d->description);
+        free(d);
+    }
+}
+
+static Value err_get_prop(Object *obj, const char *name) {
+    ErrData *d = (ErrData*)obj->data;
+    if (!d) return val_empty();
+    if (strcasecmp(name, "Number") == 0) return val_int(d->number);
+    if (strcasecmp(name, "Description") == 0) return val_str(d->description ? d->description : "");
+    if (strcasecmp(name, "Source") == 0) return val_str("");
+    if (strcasecmp(name, "HelpFile") == 0) return val_str("");
+    if (strcasecmp(name, "HelpContext") == 0) return val_int(0);
+    return val_empty();
+}
+
+static Value err_call_method(Object *obj, Interp *interp, const char *name, int argc, Value *argv) {
+    ErrData *d = (ErrData*)obj->data;
+    if (strcasecmp(name, "Clear") == 0) {
+        d->number = 0;
+        if (d->description) { free(d->description); d->description = NULL; }
+        return val_empty();
+    }
+    if (strcasecmp(name, "Raise") == 0) {
+        if (argc >= 1) {
+            int num = (int)val_toint(argv[0]);
+            char *desc = (argc >= 3) ? val_tostr(argv[2]) : strdup("Runtime error");
+            d->number = num;
+            if (d->description) { free(d->description); d->description = NULL; }
+            d->description = desc;
+            interp_error_num(interp, num, "%s", d->description);
+        }
+        return val_empty();
+    }
+    return val_empty();
+}
+
+Object *err_create(void) {
+    ErrData *d = calloc(1, sizeof(ErrData));
+    return obj_new("Err", d, err_destroy, err_get_prop, err_call_method);
+}
+
+/* ========== RegExp 对象 ========== */
+typedef struct {
+    char *pattern;
+    int global;
+    int ignorecase;
+    int multiline;
+} RegexpData;
+
+static void regexp_destroy(Object *obj) {
+    RegexpData *d = (RegexpData*)obj->data;
+    if (d) {
+        if (d->pattern) free(d->pattern);
+        free(d);
+    }
+}
+
+/* 将 VBScript 风格的 \d \w \s \b 等转译为 POSIX 正则 */
+static char *translate_pattern(const char *src) {
+    char *buf = malloc(strlen(src) * 4 + 1);
+    int pos = 0;
+    for (int i = 0; src[i]; i++) {
+        if (src[i] == '\\' && src[i + 1]) {
+            char n = src[i + 1];
+            switch (n) {
+                case 'd': strcpy(buf + pos, "[0-9]"); pos += 5; i++; continue;
+                case 'D': strcpy(buf + pos, "[^0-9]"); pos += 6; i++; continue;
+                case 'w': strcpy(buf + pos, "[A-Za-z0-9_]"); pos += 12; i++; continue;
+                case 'W': strcpy(buf + pos, "[^A-Za-z0-9_]"); pos += 13; i++; continue;
+                case 's': strcpy(buf + pos, "[[:space:]]"); pos += 11; i++; continue;
+                case 'S': strcpy(buf + pos, "[^[:space:]]"); pos += 12; i++; continue;
+                case 'n': buf[pos++] = '\n'; i++; continue;
+                case 't': buf[pos++] = '\t'; i++; continue;
+                case 'r': buf[pos++] = '\r'; i++; continue;
+                case 'f': buf[pos++] = '\f'; i++; continue;
+                case 'v': buf[pos++] = '\v'; i++; continue;
+                default: break;
+            }
+        }
+        buf[pos++] = src[i];
+    }
+    buf[pos] = 0;
+    return buf;
+}
+
+static int regexp_compile(RegexpData *d, regex_t *re) {
+    if (!d->pattern) return -1;
+    char *pat = translate_pattern(d->pattern);
+    int flags = REG_EXTENDED;
+    if (!d->ignorecase) flags |= REG_ICASE;
+    int rc = regcomp(re, pat, flags);
+    free(pat);
+    return rc;
+}
+
+static Value regexp_get_prop(Object *obj, const char *name) {
+    RegexpData *d = (RegexpData*)obj->data;
+    if (!d) return val_empty();
+    if (strcasecmp(name, "Pattern") == 0) return val_str(d->pattern ? d->pattern : "");
+    if (strcasecmp(name, "Global") == 0) return val_bool(d->global);
+    if (strcasecmp(name, "IgnoreCase") == 0) return val_bool(d->ignorecase);
+    if (strcasecmp(name, "Multiline") == 0) return val_bool(d->multiline);
+    return val_empty();
+}
+
+static Value regexp_call_method(Object *obj, Interp *interp, const char *name, int argc, Value *argv) {
+    RegexpData *d = (RegexpData*)obj->data;
+    if (strcasecmp(name, "set_Pattern") == 0) {
+        if (argc >= 1) {
+            if (d->pattern) free(d->pattern);
+            d->pattern = val_tostr(argv[0]);
+        }
+        return val_empty();
+    }
+    if (strcasecmp(name, "set_Global") == 0) {
+        if (argc >= 1) d->global = val_tobool(argv[0]);
+        return val_empty();
+    }
+    if (strcasecmp(name, "set_IgnoreCase") == 0) {
+        if (argc >= 1) d->ignorecase = val_tobool(argv[0]);
+        return val_empty();
+    }
+    if (strcasecmp(name, "set_Multiline") == 0) {
+        if (argc >= 1) d->multiline = val_tobool(argv[0]);
+        return val_empty();
+    }
+    if (strcasecmp(name, "Test") == 0) {
+        if (argc < 1) return val_bool(0);
+        if (!d->pattern) return val_bool(0);
+        char *s = val_tostr(argv[0]);
+        regex_t re;
+        int rc = regexp_compile(d, &re);
+        int matched = 0;
+        if (rc == 0) {
+            matched = regexec(&re, s, 0, NULL, 0) == 0;
+            regfree(&re);
+        }
+        free(s);
+        return val_bool(matched);
+    }
+    if (strcasecmp(name, "Replace") == 0) {
+        if (argc < 2 || !d->pattern) return val_str("");
+        char *s = val_tostr(argv[0]);
+        char *repl = val_tostr(argv[1]);
+        regex_t re;
+        int rc = regexp_compile(d, &re);
+        char *result;
+        if (rc != 0) {
+            result = strdup(s);
+        } else {
+            char buf[65536];
+            int pos = 0;
+            const char *p = s;
+            regmatch_t m;
+            int do_global = d->global;
+            while (regexec(&re, p, 1, &m, 0) == 0 && pos < 65000) {
+                int start = m.rm_so >= 0 ? m.rm_so : 0;
+                strncpy(buf + pos, p, start);
+                pos += start;
+                strcpy(buf + pos, repl);
+                pos += strlen(repl);
+                p += m.rm_eo;
+                if (!do_global) break;
+                if (m.rm_eo <= 0) p++;  /* avoid infinite loop on zero-width match */
+            }
+            strcpy(buf + pos, p);
+            pos += strlen(p);
+            buf[pos] = 0;
+            result = strdup(buf);
+            regfree(&re);
+        }
+        free(s);
+        free(repl);
+        Value r = val_str(result);
+        free(result);
+        return r;
+    }
+    if (strcasecmp(name, "Execute") == 0) {
+        if (argc < 1 || !d->pattern) return val_empty();
+        char *s = val_tostr(argv[0]);
+        regex_t re;
+        int rc = regexp_compile(d, &re);
+        if (rc != 0) {
+            free(s);
+            return val_empty();
+        }
+        const char *p = s;
+        regmatch_t m;
+        int do_global = d->global;
+        VbsArray *a = arr_new_1d(0);
+        int count = 0;
+        while (regexec(&re, p, 1, &m, 0) == 0) {
+            int start = m.rm_so >= 0 ? m.rm_so : 0;
+            int length = (m.rm_eo >= 0 ? m.rm_eo : 0) - start;
+            if (count >= a->total_size) {
+                a->dims[0] = count + 1;
+                a->data = realloc(a->data, sizeof(Value) * (count + 1));
+                memset(&a->data[count], 0, sizeof(Value));
+                a->total_size = a->dims[0];
+            }
+            char *match = malloc(length + 1);
+            strncpy(match, p + start, length);
+            match[length] = 0;
+            a->data[count++] = val_str(match);
+            free(match);
+            p += m.rm_eo;
+            if (!do_global) break;
+            if (m.rm_eo <= 0) p++;
+        }
+        a->dims[0] = count;
+        regfree(&re);
+        free(s);
+        return val_arr(a);
+    }
+    return val_empty();
+}
+
+Object *regexp_create(void) {
+    RegexpData *d = calloc(1, sizeof(RegexpData));
+    d->pattern = NULL;
+    return obj_new("RegExp", d, regexp_destroy, regexp_get_prop, regexp_call_method);
+}
+
+/* ========== WshShell 对象 ========== */
+typedef struct {
+    int dummy;
+} WshShellData;
+
+static void wshshell_destroy(Object *obj) {
+    if (obj->data) free(obj->data);
+}
+
+static Value wshshell_get_prop(Object *obj, const char *name) {
+    if (strcasecmp(name, "CurrentDirectory") == 0) {
+        char buf[4096];
+        if (getcwd(buf, sizeof(buf))) return val_str(buf);
+        return val_str("");
+    }
+    return val_empty();
+}
+
+static Value wshshell_call_method(Object *obj, Interp *interp, const char *name, int argc, Value *argv) {
+    if (strcasecmp(name, "Run") == 0) {
+        if (argc < 1) return val_int(0);
+        char *cmd = val_tostr(argv[0]);
+        int wait = (argc >= 3) ? val_tobool(argv[2]) : 0;
+        int rc = system(cmd);
+        free(cmd);
+        if (wait) return val_int(rc);
+        return val_int(0);
+    }
+    if (strcasecmp(name, "ExpandEnvironmentStrings") == 0) {
+        if (argc < 1) return val_str("");
+        char *s = val_tostr(argv[0]);
+        char buf[8192];
+        expand_environment(s, buf, sizeof(buf));
+        free(s);
+        return val_str(buf);
+    }
+    if (strcasecmp(name, "Popup") == 0) {
+        if (argc < 1) return val_int(1);
+        ensure_gtk();
+        char *msg = val_tostr(argv[0]);
+        char *title = (argc >= 3) ? val_tostr(argv[2]) : strdup("WScript");
+        GtkWidget *dialog = gtk_message_dialog_new(NULL,
+            GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg);
+        gtk_window_set_title(GTK_WINDOW(dialog), title);
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        while (gtk_events_pending()) gtk_main_iteration();
+        free(msg);
+        free(title);
+        return val_int(1);
+    }
+    if (strcasecmp(name, "SendKeys") == 0) {
+        return val_empty();
+    }
+    if (strcasecmp(name, "AppActivate") == 0) {
+        return val_empty();
+    }
+    if (strcasecmp(name, "CreateShortcut") == 0) {
+        return val_empty();
+    }
+    if (strcasecmp(name, "Exec") == 0) {
+        return val_empty();
+    }
+    return val_empty();
+}
+
+Object *wshshell_create(void) {
+    WshShellData *d = calloc(1, sizeof(WshShellData));
+    return obj_new("WshShell", d, wshshell_destroy, wshshell_get_prop, wshshell_call_method);
+}
+
 /* ========== 内置函数注册表 ========== */
 static BuiltinEntry builtins[] = {
     {"MsgBox", fn_msgbox, 1, 5},
@@ -1249,6 +2095,16 @@ static BuiltinEntry builtins[] = {
     {"TimeSerial", fn_timeserial, 3, 3},
     {"DateValue", fn_datevalue, 1, 1},
     {"TimeValue", fn_timevalue, 1, 1},
+    {"DateAdd", fn_dateadd, 3, 3},
+    {"DateDiff", fn_datediff, 3, 6},
+    {"DatePart", fn_datepart, 2, 4},
+    {"Timer", fn_timer, 0, 0},
+    {"IsDate", fn_isdate, 1, 1},
+    {"FormatDateTime", fn_formatdatetime, 1, 2},
+    {"FormatNumber", fn_formatnumber, 1, 5},
+    {"FormatPercent", fn_formatpercent, 1, 5},
+    {"FormatCurrency", fn_formatcurrency, 1, 5},
+    {"Filter", fn_filter, 2, 4},
     {"IsNull", fn_isnull, 1, 1},
     {"IsEmpty", fn_isempty, 1, 1},
     {"IsNumeric", fn_isnumeric, 1, 1},
@@ -1266,7 +2122,12 @@ static BuiltinEntry builtins[] = {
 };
 
 void builtin_init(Interp *interp) {
-    interp_set_var(interp, "WScript", val_obj(wscript_create(interp->script_path)), 0);
+    interp_set_var(interp, "WScript", val_obj(wscript_create(interp)), 0);
+
+    Object *err = err_create();
+    interp->err_obj = err;
+    interp_set_var(interp, "Err", val_obj(err), 0);
+    interp_set_var(interp, "RegExp", val_empty(), 0);
 
     for (int i = 0; builtins[i].name; i++) {
         if (builtins[i].func) {

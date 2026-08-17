@@ -28,9 +28,13 @@ static Token expect(Parser *p, TokenType type) {
 
 static Token expect_ident(Parser *p) {
     Token t = lexer_next(p->lexer);
-    if (t.type != TOK_IDENT && t.type != TOK_KEY_TRUE && t.type != TOK_KEY_FALSE) {
-        parser_error(p, "第%d行: 期望标识符, 得到 %s", t.line, token_type_name(t.type));
+    if (t.text && (t.text[0] == '_' || isalpha((unsigned char)t.text[0]))) {
+        return t;
     }
+    if (t.type == TOK_IDENT || t.type == TOK_KEY_TRUE || t.type == TOK_KEY_FALSE) {
+        return t;
+    }
+    parser_error(p, "第%d行: 期望标识符, 得到 %s", t.line, token_type_name(t.type));
     return t;
 }
 
@@ -131,25 +135,37 @@ static AstNode *parse_postfix(Parser *p, AstNode *left) {
             AstNode *prop = ast_alloc(AST_PROP_GET, t.line);
             if (left->type == AST_IDENT) {
                 prop->as.prop_get.name = strdup(left->as.ident.name);
+            } else if (left->type == AST_PROP_GET) {
+                prop->as.prop_get.name = left->as.prop_get.name ?
+                    strdup(left->as.prop_get.name) : strdup("");
             } else {
                 prop->as.prop_get.name = NULL;
             }
             Token pname = lexer_next(p->lexer);
-            if (pname.type != TOK_IDENT) {
+            if (!(pname.text && (pname.text[0] == '_' || isalpha((unsigned char)pname.text[0])))) {
                 parser_error(p, "第%d行: 期望属性名", pname.line);
                 free(prop);
                 return left;
             }
-            prop->as.prop_get.prop = strdup(pname.text);
+            if (left->type == AST_PROP_GET && left->as.prop_get.prop) {
+                char buf[512];
+                snprintf(buf, sizeof(buf), "%s.%s", left->as.prop_get.prop, pname.text);
+                prop->as.prop_get.prop = strdup(buf);
+                ast_free(left);
+            } else {
+                prop->as.prop_get.prop = strdup(pname.text);
+                ast_free(left);
+            }
 
             if (lexer_peek(p->lexer).type == TOK_LPAREN) {
                 AstNode *call = ast_alloc(AST_METHOD_CALL, t.line);
-                if (left->type == AST_IDENT) {
-                    call->as.method_call.obj = strdup(left->as.ident.name);
+                if (prop->as.prop_get.name) {
+                    call->as.method_call.obj = strdup(prop->as.prop_get.name);
                 } else {
                     call->as.method_call.obj = strdup("");
                 }
-                call->as.method_call.method = strdup(pname.text);
+                call->as.method_call.method = strdup(prop->as.prop_get.prop);
+                ast_free(prop);
                 lexer_next(p->lexer);
                 int cap = 8;
                 call->as.method_call.args = malloc(sizeof(AstNode*) * cap);
@@ -202,7 +218,18 @@ static AstNode *parse_postfix(Parser *p, AstNode *left) {
             } else {
                 idx->as.index_get.name = NULL;
             }
-            idx->as.index_get.index = parse_expr(p);
+            int cap = 4;
+            idx->as.index_get.indexes = malloc(sizeof(AstNode*) * cap);
+            idx->as.index_get.index_count = 0;
+            idx->as.index_get.indexes[idx->as.index_get.index_count++] = parse_expr(p);
+            while (lexer_peek(p->lexer).type == TOK_COMMA) {
+                lexer_next(p->lexer);
+                if (idx->as.index_get.index_count >= cap) {
+                    cap *= 2;
+                    idx->as.index_get.indexes = realloc(idx->as.index_get.indexes, sizeof(AstNode*) * cap);
+                }
+                idx->as.index_get.indexes[idx->as.index_get.index_count++] = parse_expr(p);
+            }
             expect(p, TOK_RBRACKET);
             left = idx;
         } else {
@@ -347,7 +374,7 @@ static int is_stmt_terminator(TokenType t) {
 
 static AstNode *parse_lvalue(Parser *p) {
     Token t = lexer_peek(p->lexer);
-    if (t.type != TOK_IDENT) return NULL;
+    if (!(t.text && (t.text[0] == '_' || isalpha((unsigned char)t.text[0])))) return NULL;
     lexer_next(p->lexer);
     AstNode *node = ast_alloc(AST_IDENT, t.line);
     node->as.ident.name = strdup(t.text);
@@ -379,11 +406,17 @@ static AstNode *parse_lvalue(Parser *p) {
             }
             AstNode *idx = ast_alloc(AST_INDEX_GET, n.line);
             idx->as.index_get.name = strdup(node->as.ident.name);
-            idx->as.index_get.index = parse_expr(p);
-            if (lexer_peek(p->lexer).type == TOK_COMMA) {
-                ast_free(node);
-                ast_free(idx);
-                return NULL;
+            int cap = 4;
+            idx->as.index_get.indexes = malloc(sizeof(AstNode*) * cap);
+            idx->as.index_get.index_count = 0;
+            idx->as.index_get.indexes[idx->as.index_get.index_count++] = parse_expr(p);
+            while (lexer_peek(p->lexer).type == TOK_COMMA) {
+                lexer_next(p->lexer);
+                if (idx->as.index_get.index_count >= cap) {
+                    cap *= 2;
+                    idx->as.index_get.indexes = realloc(idx->as.index_get.indexes, sizeof(AstNode*) * cap);
+                }
+                idx->as.index_get.indexes[idx->as.index_get.index_count++] = parse_expr(p);
             }
             if (lexer_peek(p->lexer).type != close) {
                 ast_free(node);
@@ -411,15 +444,17 @@ static AstNode *parse_assign_expr(Parser *p) {
             AstNode *n = ast_alloc(AST_ASSIGN, t.line);
             n->as.assign.name = strdup(left->as.ident.name);
             n->as.assign.value = parse_expr(p);
-            n->as.assign.index = NULL;
+            n->as.assign.indexes = NULL;
+            n->as.assign.index_count = 0;
             ast_free(left);
             return n;
         } else if (left->type == AST_INDEX_GET) {
             AstNode *n = ast_alloc(AST_ASSIGN, t.line);
             n->as.assign.name = strdup(left->as.index_get.name);
-            n->as.assign.index = left->as.index_get.index;
+            n->as.assign.indexes = left->as.index_get.indexes;
+            n->as.assign.index_count = left->as.index_get.index_count;
             n->as.assign.value = parse_expr(p);
-            left->as.index_get.index = NULL;
+            left->as.index_get.indexes = NULL;
             ast_free(left);
             return n;
         } else if (left->type == AST_PROP_GET) {
@@ -428,7 +463,8 @@ static AstNode *parse_assign_expr(Parser *p) {
             snprintf(buf, sizeof(buf), "%s.%s", left->as.prop_get.name, left->as.prop_get.prop);
             n->as.assign.name = strdup(buf);
             n->as.assign.value = parse_expr(p);
-            n->as.assign.index = NULL;
+            n->as.assign.indexes = NULL;
+            n->as.assign.index_count = 0;
             ast_free(left);
             return n;
         } else {
@@ -445,7 +481,9 @@ static AstNode *parse_assign_expr(Parser *p) {
 
     AstNode *e = parse_expr(p);
     Token t2 = lexer_peek(p->lexer);
-    if ((e->type == AST_PROP_GET || e->type == AST_IDENT) && !is_stmt_terminator(t2.type)) {
+    int is_plain_call = (t2.type == TOK_NEWLINE || t2.type == TOK_EOF || t2.type == TOK_COLON);
+    if ((e->type == AST_PROP_GET || e->type == AST_IDENT) &&
+        (!is_stmt_terminator(t2.type) || is_plain_call)) {
         AstNode *call = ast_alloc(AST_METHOD_CALL, t2.line);
         if (e->type == AST_PROP_GET) {
             call->as.method_call.obj = e->as.prop_get.name ?
@@ -458,14 +496,16 @@ static AstNode *parse_assign_expr(Parser *p) {
         int cap = 8;
         call->as.method_call.args = malloc(sizeof(AstNode*) * cap);
         call->as.method_call.argc = 0;
-        call->as.method_call.args[call->as.method_call.argc++] = parse_expr(p);
-        while (lexer_peek(p->lexer).type == TOK_COMMA) {
-            lexer_next(p->lexer);
-            if (call->as.method_call.argc >= cap) {
-                cap *= 2;
-                call->as.method_call.args = realloc(call->as.method_call.args, sizeof(AstNode*) * cap);
-            }
+        if (!is_plain_call) {
             call->as.method_call.args[call->as.method_call.argc++] = parse_expr(p);
+            while (lexer_peek(p->lexer).type == TOK_COMMA) {
+                lexer_next(p->lexer);
+                if (call->as.method_call.argc >= cap) {
+                    cap *= 2;
+                    call->as.method_call.args = realloc(call->as.method_call.args, sizeof(AstNode*) * cap);
+                }
+                call->as.method_call.args[call->as.method_call.argc++] = parse_expr(p);
+            }
         }
         ast_free(e);
         return call;
@@ -478,6 +518,8 @@ static AstNode *parse_var_decl(Parser *p) {
     AstNode *n = ast_alloc(AST_VAR_DECL, p->lexer->cur.line);
     int cap = 8;
     n->as.var_decl.names = malloc(sizeof(char*) * cap);
+    n->as.var_decl.dims_count = malloc(sizeof(int) * cap);
+    n->as.var_decl.dims = malloc(sizeof(int*) * cap);
     n->as.var_decl.count = 0;
     n->as.var_decl.init_expr = NULL;
 
@@ -491,8 +533,42 @@ static AstNode *parse_var_decl(Parser *p) {
         if (n->as.var_decl.count >= cap) {
             cap *= 2;
             n->as.var_decl.names = realloc(n->as.var_decl.names, sizeof(char*) * cap);
+            n->as.var_decl.dims_count = realloc(n->as.var_decl.dims_count, sizeof(int) * cap);
+            n->as.var_decl.dims = realloc(n->as.var_decl.dims, sizeof(int*) * cap);
         }
-        n->as.var_decl.names[n->as.var_decl.count++] = strdup(t.text);
+        int idx = n->as.var_decl.count;
+        n->as.var_decl.names[idx] = strdup(t.text);
+        n->as.var_decl.dims_count[idx] = 0;
+        n->as.var_decl.dims[idx] = NULL;
+
+        if (lexer_peek(p->lexer).type == TOK_LPAREN) {
+            lexer_next(p->lexer);
+            int dcap = 4;
+            int *dims = malloc(sizeof(int) * dcap);
+            int dc = 0;
+            while (lexer_peek(p->lexer).type != TOK_RPAREN && !p->error) {
+                if (dc > 0) expect(p, TOK_COMMA);
+                AstNode *d = parse_expr(p);
+                if (d->type == AST_LITERAL && d->as.literal.value.type == VALTYPE_INTEGER) {
+                    if (dc >= dcap) {
+                        dcap *= 2;
+                        dims = realloc(dims, sizeof(int) * dcap);
+                    }
+                    dims[dc++] = (int)d->as.literal.value.as.integer;
+                } else {
+                    parser_error(p, "第%d行: 数组维数必须是整数常量", d->line);
+                }
+                ast_free(d);
+            }
+            expect(p, TOK_RPAREN);
+            if (dc > 0) {
+                n->as.var_decl.dims_count[idx] = dc;
+                n->as.var_decl.dims[idx] = dims;
+            } else {
+                free(dims);
+            }
+        }
+        n->as.var_decl.count++;
     } while (lexer_peek(p->lexer).type == TOK_COMMA && (lexer_next(p->lexer), 1));
 
     return n;
@@ -618,6 +694,23 @@ static AstNode *parse_if_stmt(Parser *p) {
 }
 
 static AstNode *parse_for_stmt(Parser *p) {
+    if (lexer_peek(p->lexer).type == TOK_KEY_EACH) {
+        lexer_next(p->lexer);
+        AstNode *fe = ast_alloc(AST_FOR_EACH, p->lexer->cur.line);
+        Token var = expect_ident(p);
+        fe->as.for_each.var = strdup(var.text);
+        expect(p, TOK_KEY_IN);
+        lexer_skip_newlines(p->lexer);
+        fe->as.for_each.expr = parse_expr(p);
+        lexer_skip_newlines(p->lexer);
+        fe->as.for_each.body = parse_block(p, TOK_KEY_NEXT, "Next");
+        expect(p, TOK_KEY_NEXT);
+        if (lexer_peek(p->lexer).type == TOK_IDENT) {
+            lexer_next(p->lexer);
+        }
+        return fe;
+    }
+
     AstNode *n = ast_alloc(AST_FOR, p->lexer->cur.line);
     Token var = expect_ident(p);
     n->as.for_stmt.var = strdup(var.text);
@@ -744,30 +837,128 @@ static AstNode *parse_func_decl(Parser *p, int is_function) {
     n->as.func_decl.name = strdup(name.text);
     n->as.func_decl.is_function = is_function;
 
-    expect(p, TOK_LPAREN);
     int cap = 8;
     n->as.func_decl.params = malloc(sizeof(char*) * cap);
     n->as.func_decl.param_count = 0;
-    if (lexer_peek(p->lexer).type != TOK_RPAREN) {
-        Token pn = expect_ident(p);
-        n->as.func_decl.params[n->as.func_decl.param_count++] = strdup(pn.text);
-        while (lexer_peek(p->lexer).type == TOK_COMMA) {
-            lexer_next(p->lexer);
-            if (n->as.func_decl.param_count >= cap) {
-                cap *= 2;
-                n->as.func_decl.params = realloc(n->as.func_decl.params, sizeof(char*) * cap);
-            }
-            pn = expect_ident(p);
+    if (lexer_peek(p->lexer).type == TOK_LPAREN) {
+        lexer_next(p->lexer);
+        if (lexer_peek(p->lexer).type != TOK_RPAREN) {
+            Token pn = expect_ident(p);
             n->as.func_decl.params[n->as.func_decl.param_count++] = strdup(pn.text);
+            while (lexer_peek(p->lexer).type == TOK_COMMA) {
+                lexer_next(p->lexer);
+                if (n->as.func_decl.param_count >= cap) {
+                    cap *= 2;
+                    n->as.func_decl.params = realloc(n->as.func_decl.params, sizeof(char*) * cap);
+                }
+                pn = expect_ident(p);
+                n->as.func_decl.params[n->as.func_decl.param_count++] = strdup(pn.text);
+            }
         }
+        expect(p, TOK_RPAREN);
     }
-    expect(p, TOK_RPAREN);
     lexer_skip_newlines(p->lexer);
 
     n->as.func_decl.body = parse_block(p, is_function ? TOK_KEY_END_FUNCTION : TOK_KEY_END_SUB,
         is_function ? "End Function" : "End Sub");
     expect(p, is_function ? TOK_KEY_END_FUNCTION : TOK_KEY_END_SUB);
     return n;
+}
+
+static AstNode *parse_property(Parser *p) {
+    AstNode *n = ast_alloc(AST_PROPERTY_DECL, p->lexer->cur.line);
+    Token kind = lexer_next(p->lexer);
+    if (kind.type != TOK_KEY_GET && kind.type != TOK_KEY_LET && kind.type != TOK_KEY_SET) {
+        parser_error(p, "第%d行: 期望 Get/Let/Set, 得到 %s", kind.line, token_type_name(kind.type));
+    }
+    n->as.property_decl.kind = strdup(kind.text);
+    Token name = lexer_next(p->lexer);
+    n->as.property_decl.name = strdup(name.text);
+
+    int cap = 4;
+    n->as.property_decl.params = malloc(sizeof(char*) * cap);
+    n->as.property_decl.param_count = 0;
+
+    if (lexer_peek(p->lexer).type == TOK_LPAREN) {
+        lexer_next(p->lexer);
+        if (lexer_peek(p->lexer).type != TOK_RPAREN) {
+            Token pn = expect_ident(p);
+            n->as.property_decl.params[n->as.property_decl.param_count++] = strdup(pn.text);
+            while (lexer_peek(p->lexer).type == TOK_COMMA) {
+                lexer_next(p->lexer);
+                if (n->as.property_decl.param_count >= cap) {
+                    cap *= 2;
+                    n->as.property_decl.params = realloc(n->as.property_decl.params, sizeof(char*) * cap);
+                }
+                pn = expect_ident(p);
+                n->as.property_decl.params[n->as.property_decl.param_count++] = strdup(pn.text);
+            }
+        }
+        expect(p, TOK_RPAREN);
+    }
+    lexer_skip_newlines(p->lexer);
+    n->as.property_decl.body = parse_block(p, TOK_KEY_END_PROPERTY, "End Property");
+    expect(p, TOK_KEY_END_PROPERTY);
+    return n;
+}
+
+static AstNode *parse_class(Parser *p) {
+    AstNode *cls = ast_alloc(AST_CLASS_DECL, p->lexer->cur.line);
+    Token name = expect_ident(p);
+    cls->as.class_decl.name = strdup(name.text);
+    int cap = 16;
+    cls->as.class_decl.members = malloc(sizeof(AstNode*) * cap);
+    cls->as.class_decl.member_count = 0;
+
+    while (!p->error) {
+        lexer_skip_newlines(p->lexer);
+        Token t = lexer_peek(p->lexer);
+        if (t.type == TOK_KEY_END_CLASS) {
+            lexer_next(p->lexer);
+            break;
+        }
+        if (t.type == TOK_EOF) {
+            parser_error(p, "第%d行: 类缺少 End Class", t.line);
+            break;
+        }
+
+        if (t.type == TOK_KEY_PUBLIC || t.type == TOK_KEY_PRIVATE) {
+            lexer_next(p->lexer);
+            t = lexer_peek(p->lexer);
+        }
+
+        AstNode *member = NULL;
+        if (t.type == TOK_KEY_DIM) {
+            lexer_next(p->lexer);
+            Token mv = expect_ident(p);
+            member = ast_alloc(AST_CLASS_VAR, t.line);
+            member->as.class_var.name = strdup(mv.text);
+            while (lexer_peek(p->lexer).type == TOK_COMMA) {
+                lexer_next(p->lexer);
+                Token mv2 = expect_ident(p);
+                (void)mv2;
+            }
+        } else if (t.type == TOK_KEY_FUNCTION || t.type == TOK_KEY_SUB) {
+            int is_func = (t.type == TOK_KEY_FUNCTION);
+            lexer_next(p->lexer);
+            member = parse_func_decl(p, is_func);
+        } else if (t.type == TOK_KEY_PROPERTY) {
+            lexer_next(p->lexer);
+            member = parse_property(p);
+        } else {
+            parser_error(p, "第%d行: 类中不允许的语句", t.line);
+            break;
+        }
+
+        if (member) {
+            if (cls->as.class_decl.member_count >= cap) {
+                cap *= 2;
+                cls->as.class_decl.members = realloc(cls->as.class_decl.members, sizeof(AstNode*) * cap);
+            }
+            cls->as.class_decl.members[cls->as.class_decl.member_count++] = member;
+        }
+    }
+    return cls;
 }
 
 static AstNode *parse_with(Parser *p) {
@@ -811,6 +1002,22 @@ static AstNode *parse_block(Parser *p, TokenType end_token, const char *end_name
 
 static AstNode *parse_stmt(Parser *p) {
     lexer_skip_newlines(p->lexer);
+
+    if (lexer_peek(p->lexer).type == TOK_IDENT ||
+        (lexer_peek(p->lexer).text && (lexer_peek(p->lexer).text[0] == '_' ||
+         isalpha((unsigned char)lexer_peek(p->lexer).text[0])))) {
+        LexerSnapshot saved = lexer_save(p->lexer);
+        Token id = lexer_next(p->lexer);
+        Token colon = lexer_peek(p->lexer);
+        if (colon.type == TOK_COLON) {
+            lexer_next(p->lexer);
+            AstNode *lbl = ast_alloc(AST_LABEL, id.line);
+            lbl->as.label.name = strdup(id.text);
+            return lbl;
+        }
+        lexer_restore(p->lexer, saved);
+    }
+
     Token t = lexer_peek(p->lexer);
 
     switch (t.type) {
@@ -860,6 +1067,49 @@ static AstNode *parse_stmt(Parser *p) {
             int is_func = (t.type == TOK_KEY_FUNCTION);
             lexer_next(p->lexer);
             return parse_func_decl(p, is_func);
+        }
+        case TOK_KEY_PROPERTY: {
+            lexer_next(p->lexer);
+            return parse_property(p);
+        }
+        case TOK_KEY_CLASS: {
+            lexer_next(p->lexer);
+            return parse_class(p);
+        }
+        case TOK_KEY_TYPE: {
+            lexer_next(p->lexer);
+            Token tn = expect_ident(p);
+            AstNode *n = ast_alloc(AST_REM_STMT, t.line);
+            char *buf = malloc(strlen(tn.text) + 32);
+            snprintf(buf, strlen(tn.text) + 32, "type %s", tn.text);
+            n->as.rem_stmt.text = buf;
+            while (!p->error && lexer_peek(p->lexer).type != TOK_KEY_END_TYPE &&
+                   lexer_peek(p->lexer).type != TOK_EOF) {
+                lexer_next(p->lexer);
+            }
+            if (lexer_peek(p->lexer).type == TOK_KEY_END_TYPE) lexer_next(p->lexer);
+            return n;
+        }
+        case TOK_KEY_PUBLIC:
+        case TOK_KEY_PRIVATE: {
+            lexer_next(p->lexer);
+            Token t2 = lexer_peek(p->lexer);
+            if (t2.type == TOK_KEY_FUNCTION || t2.type == TOK_KEY_SUB) {
+                int is_func = (t2.type == TOK_KEY_FUNCTION);
+                lexer_next(p->lexer);
+                return parse_func_decl(p, is_func);
+            }
+            if (t2.type == TOK_KEY_DIM || t2.type == TOK_KEY_CONST) {
+                lexer_next(p->lexer);
+                if (t2.type == TOK_KEY_DIM) return parse_var_decl(p);
+                return parse_const_decl(p);
+            }
+            if (t2.type == TOK_KEY_PROPERTY) {
+                lexer_next(p->lexer);
+                return parse_property(p);
+            }
+            parser_error(p, "第%d行: Public/Private 后需跟 Function/Sub/Dim/Const/Property", t2.line);
+            return ast_alloc(AST_LITERAL, t.line);
         }
         case TOK_KEY_WITH: {
             lexer_next(p->lexer);
@@ -933,11 +1183,26 @@ static AstNode *parse_stmt(Parser *p) {
                     n->as.on_error.mode = 2;
                 }
             } else if (t.type == TOK_KEY_GOTO) {
+                lexer_skip_newlines(p->lexer);
                 t = lexer_next(p->lexer);
-                n->as.on_error.mode = 3;
+                if (t.type == TOK_NUMBER && strcmp(t.text, "0") == 0) {
+                    n->as.on_error.mode = 4;
+                    n->as.on_error.label = NULL;
+                } else {
+                    n->as.on_error.mode = 3;
+                    n->as.on_error.label = strdup(t.text);
+                }
             } else {
                 n->as.on_error.mode = 0;
+                n->as.on_error.label = NULL;
             }
+            return n;
+        }
+        case TOK_KEY_GOTO: {
+            lexer_next(p->lexer);
+            AstNode *n = ast_alloc(AST_GOTO, t.line);
+            Token lbl = lexer_next(p->lexer);
+            n->as.goto_stmt.name = strdup(lbl.text);
             return n;
         }
         case TOK_KEY_EXIT: {
@@ -1060,9 +1325,13 @@ void ast_free(AstNode *node) {
             free(node->as.block.stmts);
             break;
         case AST_VAR_DECL:
-            for (int i = 0; i < node->as.var_decl.count; i++)
+            for (int i = 0; i < node->as.var_decl.count; i++) {
                 free(node->as.var_decl.names[i]);
+                free(node->as.var_decl.dims[i]);
+            }
             free(node->as.var_decl.names);
+            free(node->as.var_decl.dims_count);
+            free(node->as.var_decl.dims);
             if (node->as.var_decl.init_expr) ast_free(node->as.var_decl.init_expr);
             break;
         case AST_CONST_DECL:
@@ -1074,7 +1343,11 @@ void ast_free(AstNode *node) {
         case AST_ASSIGN:
             free(node->as.assign.name);
             if (node->as.assign.value) ast_free(node->as.assign.value);
-            if (node->as.assign.index) ast_free(node->as.assign.index);
+            if (node->as.assign.indexes) {
+                for (int i = 0; i < node->as.assign.index_count; i++)
+                    ast_free(node->as.assign.indexes[i]);
+                free(node->as.assign.indexes);
+            }
             break;
         case AST_SET_ASSIGN:
             free(node->as.set_assign.name);
@@ -1165,7 +1438,11 @@ void ast_free(AstNode *node) {
             break;
         case AST_INDEX_GET:
             if (node->as.index_get.name) free(node->as.index_get.name);
-            ast_free(node->as.index_get.index);
+            if (node->as.index_get.indexes) {
+                for (int i = 0; i < node->as.index_get.index_count; i++)
+                    ast_free(node->as.index_get.indexes[i]);
+                free(node->as.index_get.indexes);
+            }
             break;
         case AST_NEW_EXPR:
             free(node->as.new_expr.class_name);
@@ -1179,6 +1456,13 @@ void ast_free(AstNode *node) {
             free(node->as.redim.dims);
             break;
         case AST_ON_ERROR:
+            if (node->as.on_error.label) free(node->as.on_error.label);
+            break;
+        case AST_LABEL:
+            free(node->as.label.name);
+            break;
+        case AST_GOTO:
+            free(node->as.goto_stmt.name);
             break;
         case AST_ERASE:
             free(node->as.erase.name);
@@ -1190,6 +1474,23 @@ void ast_free(AstNode *node) {
             free(node->as.for_each.var);
             ast_free(node->as.for_each.expr);
             ast_free(node->as.for_each.body);
+            break;
+        case AST_CLASS_DECL:
+            free(node->as.class_decl.name);
+            for (int i = 0; i < node->as.class_decl.member_count; i++)
+                ast_free(node->as.class_decl.members[i]);
+            free(node->as.class_decl.members);
+            break;
+        case AST_CLASS_VAR:
+            free(node->as.class_var.name);
+            break;
+        case AST_PROPERTY_DECL:
+            free(node->as.property_decl.name);
+            free(node->as.property_decl.kind);
+            for (int i = 0; i < node->as.property_decl.param_count; i++)
+                free(node->as.property_decl.params[i]);
+            free(node->as.property_decl.params);
+            ast_free(node->as.property_decl.body);
             break;
         default:
             break;

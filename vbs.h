@@ -119,7 +119,8 @@ typedef enum {
     AST_EXIT_DO, AST_EXIT_FOR, AST_EXIT_FUNC, AST_EXIT_SUB,
     AST_ON_ERROR, AST_ERASE, AST_REM_STMT,
     AST_LABEL, AST_GOTO, AST_RANDOMIZE,
-    AST_OPTION_EXPLICIT, AST_ARRAY_DECL
+    AST_OPTION_EXPLICIT, AST_ARRAY_DECL,
+    AST_CLASS_DECL, AST_CLASS_VAR, AST_PROPERTY_DECL
 } AstType;
 
 struct AstNode {
@@ -128,9 +129,9 @@ struct AstNode {
     union {
         struct { AstNode **stmts; int count; } program;
         struct { AstNode **stmts; int count; } block;
-        struct { char **names; int count; AstNode *init_expr; } var_decl;
+        struct { char **names; int *dims_count; int **dims; int count; AstNode *init_expr; } var_decl;
         struct { char **names; int count; AstNode *init_expr; } const_decl;
-        struct { char *name; AstNode *value; AstNode *index; } assign;
+        struct { char *name; AstNode *value; AstNode **indexes; int index_count; } assign;
         struct { char *name; AstNode *value; } set_assign;
         struct { int op; AstNode *left, *right; } binop;
         struct { int op; AstNode *operand; } unop;
@@ -150,16 +151,19 @@ struct AstNode {
         struct { char *name; AstNode **args; int argc; } funcall;
         struct { char *obj; char *method; AstNode **args; int argc; } method_call;
         struct { char *name; char *prop; } prop_get;
-        struct { char *name; AstNode *index; } index_get;
+        struct { char *name; AstNode **indexes; int index_count; } index_get;
         struct { char *class_name; AstNode *args; int argc; } new_expr;
         struct { AstNode *obj_expr; AstNode *body; } with_stmt;
         struct { char *name; int dims_count; int *dims; int preserve; } redim;
-        struct { int mode; } on_error;
+        struct { int mode; char *label; } on_error;
         struct { char *name; } erase;
         struct { char *text; } rem_stmt;
         struct { char *name; } label;
         struct { char *name; } goto_stmt;
         struct { AstNode *dims; int dims_count; } array_decl;
+        struct { char *name; AstNode **members; int member_count; } class_decl;
+        struct { char *name; } class_var;
+        struct { char *name; char *kind; char **params; int param_count; AstNode *body; } property_decl;
     } as;
 };
 
@@ -177,6 +181,11 @@ typedef struct {
     AstNode *node;
 } FuncEntry;
 
+typedef struct {
+    char *name;
+    AstNode *node;
+} ClassEntry;
+
 struct Interp {
     Env *global_env;
     Env *current_env;
@@ -184,6 +193,7 @@ struct Interp {
     int option_explicit;
     int error_occured;
     int error_line;
+    int error_num;
     int cur_line;
     char error_msg[1024];
     int on_error_resume;
@@ -196,10 +206,20 @@ struct Interp {
     char *script_path;
     char *script_dir;
     int trace;
+    char **script_args;
+    int script_arg_count;
+    int script_arg_cap;
     FuncEntry *funcs;
     int func_count;
     int func_cap;
     int exiting_func;
+    Object *err_obj;
+    ClassEntry *classes;
+    int class_count;
+    int class_cap;
+    int write_through;
+    char *goto_label;
+    char *on_error_goto_label;
 };
 
 /* ========== 内置函数注册 ========== */
@@ -227,6 +247,11 @@ long long val_toint(Value v);
 double val_todouble(Value v);
 int val_tobool(Value v);
 int val_isnum(Value v);
+
+typedef struct {
+    int number;
+    char *description;
+} ErrData;
 
 /* ========== 对象系统 ========== */
 Object *obj_new(const char *type, void *data,
@@ -298,18 +323,29 @@ int interp_has_var(Interp *interp, const char *name);
 void interp_push_env(Interp *interp);
 void interp_pop_env(Interp *interp);
 void interp_error(Interp *interp, const char *fmt, ...);
+void interp_error_num(Interp *interp, int num, const char *fmt, ...);
+void interp_add_arg(Interp *interp, const char *arg);
 
 /* ========== 内置函数初始化 ========== */
 void builtin_init(Interp *interp);
 Value builtin_call(Interp *interp, const char *name, int argc, Value *argv);
 
 /* ========== WScript 对象 ========== */
-Object *wscript_create(const char *path);
+Object *wscript_create(Interp *interp);
 
 /* ========== FileSystemObject ========== */
 Object *fso_create(void);
 
 /* ========== Dictionary 对象 ========== */
 Object *dict_create(void);
+
+/* ========== Err 对象 ========== */
+Object *err_create(void);
+
+/* ========== RegExp 对象 ========== */
+Object *regexp_create(void);
+
+/* ========== WshShell 对象 ========== */
+Object *wshshell_create(void);
 
 #endif

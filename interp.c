@@ -356,10 +356,20 @@ void interp_free(Interp *interp) {
         free(interp->funcs[i].name);
     }
     free(interp->funcs);
+    for (int i = 0; i < interp->class_count; i++) {
+        free(interp->classes[i].name);
+    }
+    free(interp->classes);
+    for (int i = 0; i < interp->script_arg_count; i++) {
+        free(interp->script_args[i]);
+    }
+    free(interp->script_args);
+    if (interp->goto_label) free(interp->goto_label);
+    if (interp->on_error_goto_label) free(interp->on_error_goto_label);
     free(interp);
 }
 
-void interp_error(Interp *interp, const char *fmt, ...) {
+void interp_error_num(Interp *interp, int num, const char *fmt, ...) {
     va_list ap;
     char tmp[1024];
     va_start(ap, fmt);
@@ -370,14 +380,45 @@ void interp_error(Interp *interp, const char *fmt, ...) {
         interp->cur_line ? interp->cur_line : interp->error_line, tmp);
     interp->error_line = interp->cur_line;
     interp->error_occured = 1;
-    if (!interp->on_error_resume) {
+    interp->error_num = num;
+    if (interp->err_obj && interp->err_obj->data) {
+        ErrData *e = (ErrData*)interp->err_obj->data;
+        e->number = num;
+        if (e->description) { free(e->description); e->description = NULL; }
+        e->description = strdup(interp->error_msg);
+    }
+    if (interp->on_error_goto_label) {
+        if (interp->goto_label) free(interp->goto_label);
+        interp->goto_label = strdup(interp->on_error_goto_label);
+        free(interp->on_error_goto_label);
+        interp->on_error_goto_label = NULL;
+        interp->on_error_resume = 0;
+        interp->error_occured = 0;
+    } else if (!interp->on_error_resume) {
         interp->running = 0;
     }
+}
+
+void interp_error(Interp *interp, const char *fmt, ...) {
+    va_list ap;
+    char tmp[1024];
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    interp_error_num(interp, 0, "%s", tmp);
 }
 
 void interp_push_env(Interp *interp) {
     Env *new_env = env_new(interp->current_env);
     interp->current_env = new_env;
+}
+
+void interp_add_arg(Interp *interp, const char *arg) {
+    if (interp->script_arg_count >= interp->script_arg_cap) {
+        interp->script_arg_cap = interp->script_arg_cap ? interp->script_arg_cap * 2 : 8;
+        interp->script_args = realloc(interp->script_args, sizeof(char*) * interp->script_arg_cap);
+    }
+    interp->script_args[interp->script_arg_count++] = strdup(arg);
 }
 
 void interp_pop_env(Interp *interp) {
@@ -407,6 +448,10 @@ Value interp_get_var(Interp *interp, const char *name) {
 
 void interp_set_var(Interp *interp, const char *name, Value val, int is_const) {
     Variable *v = env_find(interp->current_env, name);
+    if (interp->write_through && !v) {
+        Variable *t = env_find(interp->current_env->parent, name);
+        if (t) v = t;
+    }
     if (v) {
         if (v->is_const && !is_const) return;
         val_free(&v->value);
@@ -444,6 +489,161 @@ static FuncEntry *interp_find_func(Interp *interp, const char *name) {
     return NULL;
 }
 
+static void interp_register_class(Interp *interp, const char *name, AstNode *node) {
+    for (int i = 0; i < interp->class_count; i++) {
+        if (strcasecmp(interp->classes[i].name, name) == 0) {
+            free(interp->classes[i].name);
+            interp->classes[i].name = strdup(name);
+            interp->classes[i].node = node;
+            return;
+        }
+    }
+    if (interp->class_count >= interp->class_cap) {
+        interp->class_cap = interp->class_cap ? interp->class_cap * 2 : 16;
+        interp->classes = realloc(interp->classes, sizeof(ClassEntry) * interp->class_cap);
+    }
+    interp->classes[interp->class_count].name = strdup(name);
+    interp->classes[interp->class_count].node = node;
+    interp->class_count++;
+}
+
+static ClassEntry *interp_find_class(Interp *interp, const char *name) {
+    for (int i = 0; i < interp->class_count; i++) {
+        if (strcasecmp(interp->classes[i].name, name) == 0) {
+            return &interp->classes[i];
+        }
+    }
+    return NULL;
+}
+
+typedef struct {
+    AstNode *class_node;
+    Env *instance_env;
+} ClassInstance;
+
+static void class_instance_destroy(Object *obj) {
+    ClassInstance *ci = (ClassInstance*)obj->data;
+    if (ci) {
+        if (ci->instance_env) env_free(ci->instance_env);
+        free(ci);
+    }
+}
+
+static AstNode *class_find_method(AstNode *class_node, const char *name, const char *kind) {
+    for (int i = 0; i < class_node->as.class_decl.member_count; i++) {
+        AstNode *m = class_node->as.class_decl.members[i];
+        if (m->type == AST_FUNC_DECL || m->type == AST_SUB_DECL) {
+            if (!kind && strcasecmp(m->as.func_decl.name, name) == 0) return m;
+        } else if (m->type == AST_PROPERTY_DECL) {
+            if (strcasecmp(m->as.property_decl.name, name) == 0) {
+                if (kind) {
+                    if (strcasecmp(m->as.property_decl.kind, kind) == 0) return m;
+                } else {
+                    return m;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static void class_define_members(Interp *interp, ClassInstance *ci) {
+    AstNode *cls = ci->class_node;
+    for (int i = 0; i < cls->as.class_decl.member_count; i++) {
+        AstNode *m = cls->as.class_decl.members[i];
+        if (m->type == AST_CLASS_VAR) {
+            env_set(ci->instance_env, m->as.class_var.name, val_empty(), 0);
+        }
+    }
+}
+
+static Value class_get_prop(Object *obj, const char *name) {
+    ClassInstance *ci = (ClassInstance*)obj->data;
+    if (!ci) return val_empty();
+    Variable *v = env_find(ci->instance_env, name);
+    if (v) return val_clone(v->value);
+    return val_empty();
+}
+
+static Value class_call_method(Object *obj, Interp *interp, const char *name, int argc, Value *argv) {
+    ClassInstance *ci = (ClassInstance*)obj->data;
+    if (!ci) return val_empty();
+
+    int saved_wt = interp->write_through;
+    interp->write_through = 1;
+
+    if (strncasecmp(name, "set_", 4) == 0) {
+        AstNode *m = class_find_method(ci->class_node, name + 4, "Let");
+        if (!m) m = class_find_method(ci->class_node, name + 4, "Set");
+        if (m && m->type == AST_PROPERTY_DECL) {
+            interp_push_env(interp);
+            interp->current_env->parent = ci->instance_env;
+            for (int i = 0; i < m->as.property_decl.param_count; i++) {
+                if (i < argc) {
+                    interp_set_var(interp, m->as.property_decl.params[i], val_clone(argv[i]), 0);
+                } else {
+                    interp_set_var(interp, m->as.property_decl.params[i], val_empty(), 0);
+                }
+            }
+            int saved_exiting = interp->exiting_func;
+            interp->exiting_func = 0;
+            interp_eval(interp, m->as.property_decl.body);
+            interp->exiting_func = saved_exiting;
+            interp_pop_env(interp);
+            interp->write_through = saved_wt;
+            return val_empty();
+        }
+    }
+
+    AstNode *m = class_find_method(ci->class_node, name, NULL);
+    if (m) {
+        if (m->type == AST_PROPERTY_DECL) {
+            interp_push_env(interp);
+            interp->current_env->parent = ci->instance_env;
+            for (int i = 0; i < m->as.property_decl.param_count; i++) {
+                if (i < argc) {
+                    interp_set_var(interp, m->as.property_decl.params[i], val_clone(argv[i]), 0);
+                } else {
+                    interp_set_var(interp, m->as.property_decl.params[i], val_empty(), 0);
+                }
+            }
+            int saved_exiting = interp->exiting_func;
+            interp->exiting_func = 0;
+            interp_eval(interp, m->as.property_decl.body);
+            interp->exiting_func = saved_exiting;
+            Value r = val_empty();
+            Variable *v = env_find(interp->current_env, m->as.property_decl.name);
+            if (v) r = val_clone(v->value);
+            interp_pop_env(interp);
+            interp->write_through = saved_wt;
+            return r;
+        }
+        interp_push_env(interp);
+        interp->current_env->parent = ci->instance_env;
+        for (int i = 0; i < m->as.func_decl.param_count; i++) {
+            if (i < argc) {
+                interp_set_var(interp, m->as.func_decl.params[i], val_clone(argv[i]), 0);
+            } else {
+                interp_set_var(interp, m->as.func_decl.params[i], val_empty(), 0);
+            }
+        }
+        int saved_exiting = interp->exiting_func;
+        interp->exiting_func = 0;
+        interp_eval(interp, m->as.func_decl.body);
+        interp->exiting_func = saved_exiting;
+        Value r = val_empty();
+        if (m->type == AST_FUNC_DECL) {
+            Variable *v = env_find(interp->current_env, m->as.func_decl.name);
+            if (v) r = val_clone(v->value);
+        }
+        interp_pop_env(interp);
+        interp->write_through = saved_wt;
+        return r;
+    }
+    interp->write_through = saved_wt;
+    return val_empty();
+}
+
 static Value interp_call_userfunc(Interp *interp, FuncEntry *fn, int argc, Value *argv) {
     AstNode *decl = fn->node;
     interp_push_env(interp);
@@ -472,47 +672,74 @@ static Value interp_call_userfunc(Interp *interp, FuncEntry *fn, int argc, Value
     return r;
 }
 
+static int val_is_numeric_string(Value v) {
+    if (v.type == VALTYPE_STRING && v.as.str) {
+        if (v.as.str[0] == 0) return 0;
+        char *end;
+        strtod(v.as.str, &end);
+        return *end == 0;
+    }
+    return 1;
+}
+
 static Value interp_eval_binop(Interp *interp, int op, Value left, Value right) {
     Value r = val_empty();
 
     switch (op) {
         case TOK_PLUS: {
             if (left.type == VALTYPE_STRING || right.type == VALTYPE_STRING) {
-                char *ls = val_tostr(left);
-                char *rs = val_tostr(right);
-                char *buf = malloc(strlen(ls) + strlen(rs) + 1);
-                strcpy(buf, ls);
-                strcat(buf, rs);
-                r = val_str(buf);
-                free(buf);
-                free(ls);
-                free(rs);
+                if (val_is_numeric_string(left) && val_is_numeric_string(right)) {
+                    r = val_double(val_todouble(left) + val_todouble(right));
+                } else {
+                    char *ls = val_tostr(left);
+                    char *rs = val_tostr(right);
+                    char *buf = malloc(strlen(ls) + strlen(rs) + 1);
+                    strcpy(buf, ls);
+                    strcat(buf, rs);
+                    r = val_str(buf);
+                    free(buf);
+                    free(ls);
+                    free(rs);
+                }
             } else {
                 r = val_double(val_todouble(left) + val_todouble(right));
             }
             break;
         }
-        case TOK_MINUS: r = val_double(val_todouble(left) - val_todouble(right)); break;
-        case TOK_MUL: r = val_double(val_todouble(left) * val_todouble(right)); break;
-        case TOK_DIV: {
+        case TOK_MINUS:
+        case TOK_MUL:
+        case TOK_DIV:
+        case TOK_INTDIV:
+        case TOK_MOD:
+        case TOK_POW: {
+            if (!val_is_numeric_string(left) || !val_is_numeric_string(right)) {
+                val_free(&left);
+                val_free(&right);
+                interp_error_num(interp, 13, "类型不匹配");
+                return val_empty();
+            }
             double rd = val_todouble(right);
-            if (rd == 0.0) { val_free(&left); val_free(&right); interp_error(interp, "除以零"); return val_empty(); }
-            r = val_double(val_todouble(left) / rd);
+            if (op == TOK_DIV && rd == 0.0) {
+                val_free(&left); val_free(&right);
+                interp_error_num(interp, 11, "除以零");
+                return val_empty();
+            }
+            if (op == TOK_MINUS) r = val_double(val_todouble(left) - val_todouble(right));
+            else if (op == TOK_MUL) r = val_double(val_todouble(left) * val_todouble(right));
+            else if (op == TOK_DIV) r = val_double(val_todouble(left) / rd);
+            else if (op == TOK_INTDIV) {
+                long long rv = val_toint(right);
+                if (rv == 0) { val_free(&left); val_free(&right); interp_error_num(interp, 11, "除以零"); return val_empty(); }
+                r = val_int(val_toint(left) / rv);
+            } else if (op == TOK_MOD) {
+                long long rv = val_toint(right);
+                if (rv == 0) { val_free(&left); val_free(&right); interp_error_num(interp, 11, "除以零"); return val_empty(); }
+                r = val_int(val_toint(left) % rv);
+            } else {
+                r = val_double(pow(val_todouble(left), val_todouble(right)));
+            }
             break;
         }
-        case TOK_INTDIV: {
-            long long l = val_toint(left), rv = val_toint(right);
-            if (rv == 0) { interp_error(interp, "除以零"); return val_empty(); }
-            r = val_int(l / rv);
-            break;
-        }
-        case TOK_MOD: {
-            long long l = val_toint(left), rv = val_toint(right);
-            if (rv == 0) { interp_error(interp, "除以零"); return val_empty(); }
-            r = val_int(l % rv);
-            break;
-        }
-        case TOK_POW: r = val_double(pow(val_todouble(left), val_todouble(right))); break;
         case TOK_CONCAT: {
             char *ls = val_tostr(left);
             char *rs = val_tostr(right);
@@ -587,6 +814,16 @@ static Value interp_eval_binop(Interp *interp, int op, Value left, Value right) 
             }
             break;
         }
+        case TOK_IS: {
+            if (left.type == VALTYPE_OBJECT && right.type == VALTYPE_OBJECT) {
+                r = val_bool(left.as.obj == right.as.obj);
+            } else if (left.type == VALTYPE_NOTHING || right.type == VALTYPE_NOTHING) {
+                r = val_bool(left.type == right.type);
+            } else {
+                r = val_bool(left.type == right.type && left.as.obj == right.as.obj);
+            }
+            break;
+        }
         case TOK_KEY_AND: r = val_bool(val_tobool(left) && val_tobool(right)); break;
         case TOK_KEY_OR: r = val_bool(val_tobool(left) || val_tobool(right)); break;
         case TOK_KEY_XOR: r = val_bool(val_tobool(left) != val_tobool(right)); break;
@@ -608,8 +845,17 @@ Value interp_eval(Interp *interp, AstNode *node) {
         case AST_BLOCK: {
             Value r = val_empty();
             for (int i = 0; i < node->as.block.count && interp->running && !interp->exiting_func; i++) {
+                AstNode *s = node->as.block.stmts[i];
+                if (interp->goto_label) {
+                    if (s->type == AST_LABEL &&
+                        strcasecmp(interp->goto_label, s->as.label.name) == 0) {
+                        free(interp->goto_label);
+                        interp->goto_label = NULL;
+                    }
+                    continue;
+                }
                 val_free(&r);
-                r = interp_eval(interp, node->as.block.stmts[i]);
+                r = interp_eval(interp, s);
             }
             return r;
         }
@@ -618,8 +864,18 @@ Value interp_eval(Interp *interp, AstNode *node) {
             Value init = node->as.var_decl.init_expr ?
                 interp_eval(interp, node->as.var_decl.init_expr) : val_empty();
             for (int i = 0; i < node->as.var_decl.count; i++) {
-                interp_set_var(interp, node->as.var_decl.names[i],
-                    val_clone(init), 0);
+                if (node->as.var_decl.dims_count[i] > 0) {
+                    int *sizes = malloc(sizeof(int) * node->as.var_decl.dims_count[i]);
+                    for (int d = 0; d < node->as.var_decl.dims_count[i]; d++) {
+                        sizes[d] = node->as.var_decl.dims[i][d] + 1;
+                    }
+                    VbsArray *a = arr_new(node->as.var_decl.dims_count[i], sizes);
+                    free(sizes);
+                    interp_set_var(interp, node->as.var_decl.names[i], val_arr(a), 0);
+                } else {
+                    interp_set_var(interp, node->as.var_decl.names[i],
+                        val_clone(init), 0);
+                }
             }
             val_free(&init);
             return val_empty();
@@ -639,22 +895,42 @@ Value interp_eval(Interp *interp, AstNode *node) {
         case AST_ASSIGN: {
             Value v = interp_eval(interp, node->as.assign.value);
             char *name = node->as.assign.name;
-            if (node->as.assign.index) {
+            if (node->as.assign.index_count > 0) {
                 Value av = interp_get_var(interp, name);
                 if (av.type == VALTYPE_ARRAY && av.as.arr) {
-                    Value iv = interp_eval(interp, node->as.assign.index);
-                    long long index = val_toint(iv);
-                    val_free(&iv);
-                    if (index >= 0 && index < av.as.arr->total_size) {
-                        val_free(&av.as.arr->data[index]);
-                        av.as.arr->data[index] = val_clone(v);
+                    int *indices = malloc(sizeof(int) * node->as.assign.index_count);
+                    for (int k = 0; k < node->as.assign.index_count; k++) {
+                        Value iv = interp_eval(interp, node->as.assign.indexes[k]);
+                        indices[k] = (int)val_toint(iv);
+                        val_free(&iv);
                     }
+                    int idx = arr_idx(av.as.arr, node->as.assign.index_count, indices);
+                    if (idx >= 0 && idx < av.as.arr->total_size) {
+                        val_free(&av.as.arr->data[idx]);
+                        av.as.arr->data[idx] = val_clone(v);
+                    }
+                    free(indices);
                 }
                 val_free(&av);
                 val_free(&v);
                 return val_empty();
             }
             if (strchr(name, '.')) {
+                char *dot = strchr(name, '.');
+                char objname[256];
+                int olen = dot - name;
+                if (olen > 0 && olen < 256) {
+                    strncpy(objname, name, olen);
+                    objname[olen] = 0;
+                    Value o = interp_get_var(interp, objname);
+                    if (o.type == VALTYPE_OBJECT && o.as.obj && o.as.obj->call_method) {
+                        char method[512];
+                        snprintf(method, sizeof(method), "set_%s", dot + 1);
+                        Value r = o.as.obj->call_method(o.as.obj, interp, method, 1, &v);
+                        val_free(&r);
+                    }
+                    val_free(&o);
+                }
                 val_free(&v);
                 return val_empty();
             }
@@ -741,6 +1017,29 @@ Value interp_eval(Interp *interp, AstNode *node) {
                 interp_set_var(interp, node->as.for_stmt.var, val_double(i), 0);
                 interp_eval(interp, node->as.for_stmt.body);
             }
+            return val_empty();
+        }
+
+        case AST_FOR_EACH: {
+            Value collection = interp_eval(interp, node->as.for_each.expr);
+            if (collection.type == VALTYPE_ARRAY && collection.as.arr) {
+                VbsArray *a = collection.as.arr;
+                for (int i = 0; i < a->total_size && interp->running; i++) {
+                    interp_set_var(interp, node->as.for_each.var, val_clone(a->data[i]), 0);
+                    interp_eval(interp, node->as.for_each.body);
+                }
+            } else if (collection.type == VALTYPE_OBJECT && collection.as.obj && collection.as.obj->call_method) {
+                Value items = collection.as.obj->call_method(collection.as.obj, interp, "Items", 0, NULL);
+                if (items.type == VALTYPE_ARRAY && items.as.arr) {
+                    VbsArray *a = items.as.arr;
+                    for (int i = 0; i < a->total_size && interp->running; i++) {
+                        interp_set_var(interp, node->as.for_each.var, val_clone(a->data[i]), 0);
+                        interp_eval(interp, node->as.for_each.body);
+                    }
+                }
+                val_free(&items);
+            }
+            val_free(&collection);
             return val_empty();
         }
 
@@ -831,11 +1130,16 @@ Value interp_eval(Interp *interp, AstNode *node) {
             }
             Variable *var = env_find(interp->current_env, name);
             if (var && var->value.type == VALTYPE_ARRAY && var->value.as.arr && argc >= 1) {
-                long long i = val_toint(args[0]);
-                for (int k = 0; k < argc; k++) val_free(&args[k]);
+                int *indices = malloc(sizeof(int) * argc);
+                for (int k = 0; k < argc; k++) {
+                    indices[k] = (int)val_toint(args[k]);
+                    val_free(&args[k]);
+                }
                 free(args);
-                if (i >= 0 && i < var->value.as.arr->total_size) {
-                    return val_clone(var->value.as.arr->data[i]);
+                int idx = arr_idx(var->value.as.arr, argc, indices);
+                free(indices);
+                if (idx >= 0 && idx < var->value.as.arr->total_size) {
+                    return val_clone(var->value.as.arr->data[idx]);
                 }
                 return val_empty();
             }
@@ -917,6 +1221,20 @@ Value interp_eval(Interp *interp, AstNode *node) {
         }
 
         case AST_NEW_EXPR: {
+            ClassEntry *ce = interp_find_class(interp, node->as.new_expr.class_name);
+            if (ce) {
+                ClassInstance *ci = calloc(1, sizeof(ClassInstance));
+                ci->class_node = ce->node;
+                ci->instance_env = env_new(interp->global_env);
+                class_define_members(interp, ci);
+                Object *inst = obj_new(ce->name, ci, class_instance_destroy,
+                    class_get_prop, class_call_method);
+                AstNode *init = class_find_method(ce->node, "Class_Initialize", NULL);
+                if (init) {
+                    class_call_method(inst, interp, "Class_Initialize", 0, NULL);
+                }
+                return val_obj(inst);
+            }
             if (strcasecmp(node->as.new_expr.class_name, "FileSystemObject") == 0 ||
                 strcasecmp(node->as.new_expr.class_name, "Scripting.FileSystemObject") == 0) {
                 return val_obj(fso_create());
@@ -925,12 +1243,51 @@ Value interp_eval(Interp *interp, AstNode *node) {
                 strcasecmp(node->as.new_expr.class_name, "Scripting.Dictionary") == 0) {
                 return val_obj(dict_create());
             }
+            if (strcasecmp(node->as.new_expr.class_name, "RegExp") == 0 ||
+                strcasecmp(node->as.new_expr.class_name, "VBScript.RegExp") == 0) {
+                return val_obj(regexp_create());
+            }
             interp_error(interp, "未知的类: %s", node->as.new_expr.class_name);
             return val_empty();
         }
 
+        case AST_CLASS_DECL: {
+            interp_register_class(interp, node->as.class_decl.name, node);
+            return val_empty();
+        }
+
+        case AST_CLASS_VAR: {
+            return val_empty();
+        }
+
+        case AST_PROPERTY_DECL: {
+            return val_empty();
+        }
+
         case AST_ON_ERROR: {
-            interp->on_error_resume = (node->as.on_error.mode == 1);
+            interp->on_error_resume = (node->as.on_error.mode == 1 || node->as.on_error.mode == 3);
+            if (node->as.on_error.mode == 3 && node->as.on_error.label) {
+                if (interp->on_error_goto_label) free(interp->on_error_goto_label);
+                interp->on_error_goto_label = strdup(node->as.on_error.label);
+            } else if (node->as.on_error.mode == 4) {
+                if (interp->on_error_goto_label) { free(interp->on_error_goto_label); interp->on_error_goto_label = NULL; }
+                interp->on_error_resume = 0;
+            }
+            return val_empty();
+        }
+
+        case AST_GOTO: {
+            if (interp->goto_label) free(interp->goto_label);
+            interp->goto_label = strdup(node->as.goto_stmt.name);
+            return val_empty();
+        }
+
+        case AST_LABEL: {
+            if (interp->goto_label &&
+                strcasecmp(interp->goto_label, node->as.label.name) == 0) {
+                free(interp->goto_label);
+                interp->goto_label = NULL;
+            }
             return val_empty();
         }
 
@@ -950,11 +1307,26 @@ Value interp_eval(Interp *interp, AstNode *node) {
         }
 
         case AST_REDIM: {
-            int size = 1;
+            int *sizes = malloc(sizeof(int) * node->as.redim.dims_count);
+            int preserve = node->as.redim.preserve;
             for (int i = 0; i < node->as.redim.dims_count; i++) {
-                size *= (node->as.redim.dims[i] + 1);
+                sizes[i] = node->as.redim.dims[i] + 1;
             }
-            VbsArray *a = arr_new_1d(size);
+            VbsArray *old = NULL;
+            Value av = interp_get_var(interp, node->as.redim.name);
+            if (av.type == VALTYPE_ARRAY && av.as.arr) old = av.as.arr;
+
+            VbsArray *a = arr_new(node->as.redim.dims_count, sizes);
+            if (preserve && old) {
+                int ncopy = a->total_size;
+                if (old->total_size < ncopy) ncopy = old->total_size;
+                for (int i = 0; i < ncopy; i++) {
+                    a->data[i] = val_clone(old->data[i]);
+                }
+                av.as.arr = NULL;
+            }
+            val_free(&av);
+            free(sizes);
             interp_set_var(interp, node->as.redim.name, val_arr(a), 0);
             return val_empty();
         }
@@ -977,16 +1349,21 @@ Value interp_eval(Interp *interp, AstNode *node) {
 
         case AST_INDEX_GET: {
             Value arr = interp_get_var(interp, node->as.index_get.name);
-            Value idx = interp_eval(interp, node->as.index_get.index);
             Value r = val_empty();
             if (arr.type == VALTYPE_ARRAY && arr.as.arr) {
-                long long i = val_toint(idx);
-                if (i >= 0 && i < arr.as.arr->total_size) {
-                    r = val_clone(arr.as.arr->data[i]);
+                int *indices = malloc(sizeof(int) * node->as.index_get.index_count);
+                for (int k = 0; k < node->as.index_get.index_count; k++) {
+                    Value iv = interp_eval(interp, node->as.index_get.indexes[k]);
+                    indices[k] = (int)val_toint(iv);
+                    val_free(&iv);
+                }
+                int idx = arr_idx(arr.as.arr, node->as.index_get.index_count, indices);
+                free(indices);
+                if (idx >= 0 && idx < arr.as.arr->total_size) {
+                    r = val_clone(arr.as.arr->data[idx]);
                 }
             }
             val_free(&arr);
-            val_free(&idx);
             return r;
         }
 
